@@ -1,0 +1,81 @@
+{% load static %}
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="银鼎土凝岩客资运营中心登录" />
+    <title>登录 · 银鼎客资运营中心</title>
+    <link rel="stylesheet" href="{% static 'login.css' %}?v=20260725-1" />
+  </head>
+  <body>
+    <main class="login-shell">
+      <section class="login-brand">
+        <div class="brand-content">
+          <span class="brand-mark">YD</span>
+          <p>YINDING CUSTOMER OPERATIONS</p>
+          <h1>把每一条客资，<br />变成清晰可见的进展。</h1>
+          <span class="brand-copy">集中管理客户、项目、负责人和跟进状态，让团队协作更简单。</span>
+          <div class="brand-points">
+            <span><i></i>客户信息统一沉淀</span>
+            <span><i></i>项目进度实时同步</span>
+            <span><i></i>业务数据清晰可视</span>
+          </div>
+        </div>
+        <div class="brand-orbit orbit-one"></div>
+        <div class="brand-orbit orbit-two"></div>
+      </section>
+
+      <section class="login-area">
+        <div class="login-card">
+          <header>
+            <div class="mobile-brand"><span>YD</span><strong>银鼎客资</strong></div>
+            <p>WELCOME BACK</p>
+            <h2>登录业务系统</h2>
+            <span>使用管理员创建的员工账号登录</span>
+          </header>
+
+          {% if form.errors %}
+            <div class="login-error"><i>!</i><span>用户名或密码不正确，请重新输入。</span></div>
+          {% endif %}
+
+          <form method="post" action="{% url 'login' %}">
+            {% csrf_token %}
+            <label>
+              <span>用户名</span>
+              <div class="input-wrap">
+                <i class="user-icon"></i>
+                <input
+                  name="username"
+                  type="text"
+                  value="{{ form.username.value|default:'' }}"
+                  autocomplete="username"
+                  autofocus
+                  required
+                  placeholder="请输入员工用户名"
+                />
+              </div>
+            </label>
+            <label>
+              <span>密码</span>
+              <div class="input-wrap">
+                <i class="lock-icon"></i>
+                <input
+                  name="password"
+                  type="password"
+                  autocomplete="current-password"
+                  required
+                  placeholder="请输入登录密码"
+                />
+              </div>
+            </label>
+            {% if next %}<input type="hidden" name="next" value="{{ next }}" />{% endif %}
+            <button class="login-submit" type="submit"><span>登录系统</span><i>→</i></button>
+          </form>
+
+          <footer><i></i><span>银鼎土凝岩 · 内部业务系统</span></footer>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

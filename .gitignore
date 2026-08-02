@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.py[cod]
+db.sqlite3
+.env
+private-backup/
+*.log
+.idea/
+.vscode/
+frontend/node_modules/
+frontend_dist/
+
+# Local visual audit screenshots (not required to run the website)
+/customers-audit.png
+/desktop-audit-ready.png
+/desktop-audit.png
+/followups-audit.png
+/heatmap-audit.png
+/mobile-audit-ready.png
+/mobile-audit.png
+/mobile-cache-fixed.png
+/mobile-final.png
+/overview-redesign-audit.png
+/plans-mobile-audit.png
+/plans-mobile-final.png

@@ -1,0 +1,2 @@
+Django==6.0.7
+django-simpleui==2026.1.13

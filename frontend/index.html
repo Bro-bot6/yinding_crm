@@ -1,0 +1,401 @@
+{% load static %}
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      if (window.location.protocol === 'file:') {
+        window.location.replace('http://127.0.0.1:8000/')
+      }
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="银鼎土凝岩客资运营中心" />
+    <title>银鼎客资运营中心</title>
+    <link rel="stylesheet" href="{% static 'style.css' %}?v=20260802-8" />
+  </head>
+  <body>
+    <div id="app" v-cloak>
+      <div class="app-shell" :data-theme="theme">
+        <aside class="sidebar">
+          <div class="logo-wrap">
+            <span class="logo-mark">YD</span>
+            <div><strong>银鼎客资</strong><small>土凝岩业务中心</small></div>
+          </div>
+
+          <nav class="side-nav" aria-label="主要导航">
+            <p>工作台</p>
+            <button v-for="item in navItems" :key="item.id" :class="{ active: activePage === item.id }" @click="switchPage(item.id)">
+              <span class="nav-icon" v-text="item.icon"></span>
+              <span v-text="item.label"></span>
+              <b v-if="item.badge" v-text="item.badge"></b>
+            </button>
+          </nav>
+
+          <div class="side-bottom">
+            {% if request.user.is_superuser %}
+            <a href="/admin/"><span class="nav-icon">管</span><span>系统管理</span></a>
+            {% endif %}
+            <div class="profile">
+              <span class="avatar">{{ request.user.username|first|upper }}</span>
+              <div>
+                <strong>{% if request.user.employee_profile.nickname %}{{ request.user.employee_profile.nickname }}{% else %}{{ request.user.username }}{% endif %}</strong>
+                <small>{% if request.user.is_superuser %}超级管理员{% elif request.user.employee_profile %}{{ request.user.employee_profile.get_role_display }}{% else %}员工账号{% endif %}</small>
+              </div>
+              <form class="logout-form" method="post" action="{% url 'logout' %}">
+                {% csrf_token %}
+                <button class="logout-btn" type="submit" title="退出登录">退出</button>
+              </form>
+            </div>
+          </div>
+        </aside>
+
+        <main class="workspace">
+          <header class="topbar">
+            <div class="mobile-logo"><span class="logo-mark">YD</span><strong>银鼎客资</strong></div>
+            <div class="crumb"><span>客资中心</span><b>/</b><strong v-text="pageTitle"></strong></div>
+            <div class="top-actions">
+              <label class="search"><span>⌕</span><input v-model="keyword" placeholder="搜索客户、电话、项目" /></label>
+              <div class="theme-picker" title="切换界面风格">
+                <button v-for="option in themes" :key="option.id" :class="[option.id, { active: theme === option.id }]" @click="setTheme(option.id)" :title="option.name"><i></i></button>
+              </div>
+              <button class="primary-btn" @click="showCreate = true"><span>＋</span> 新建客资</button>
+              <form class="mobile-logout" method="post" action="{% url 'logout' %}">
+                {% csrf_token %}
+                <button type="submit" title="退出登录">退</button>
+              </form>
+            </div>
+          </header>
+
+          <div class="content">
+            <section v-if="activePage === 'overview'" class="page overview-page">
+              <div class="page-heading">
+                <div><p class="kicker">OVERVIEW</p><h1>客资经营总览</h1><span>实时掌握客户质量、跟进效率与项目进展</span></div>
+                <div class="date-chip"><span>统计周期</span><strong v-text="currentPeriodLabel"></strong></div>
+              </div>
+
+              <div class="metric-grid">
+                <article v-for="metric in metrics" :key="metric.label" class="metric-card overview-link" role="button" tabindex="0" @click="handleMetric(metric)" @keydown.enter="handleMetric(metric)">
+                  <div class="metric-head"><span v-text="metric.label"></span><i :class="metric.tone" v-text="metric.icon"></i></div>
+                  <div class="metric-value"><strong v-text="metric.value"></strong><small :class="metric.trend > 0 ? 'up' : 'neutral'" v-text="metric.change"></small></div>
+                  <p v-text="metric.note"></p>
+                  <div class="micro-bars"><i v-for="height in metric.bars" :style="{ height: `${height}%` }"></i></div>
+                  <span class="module-arrow">查看详情 →</span>
+                </article>
+              </div>
+
+              <div class="analytics-grid">
+                <article class="panel trend-panel overview-link" role="button" tabindex="0" @click="openCustomerList()" @keydown.enter="openCustomerList()">
+                  <div class="panel-head"><div><h2>新增客资趋势</h2><p>近 30 天各来源累计客资</p></div><div class="panel-actions"><div class="legend"><span v-for="source in sourceStats" :key="source.name"><i :class="source.className"></i><b v-text="source.name"></b><em v-text="source.value"></em></span></div><span class="detail-chip">查看客资 →</span></div></div>
+                  <div class="trend-chart">
+                    <div class="axis-labels"><span>10</span><span>8</span><span>6</span><span>4</span><span>0</span></div>
+                    <svg viewBox="0 0 700 230" preserveAspectRatio="none" aria-label="新增客资趋势图">
+                      <defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".28"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+                      <g class="grid-lines"><line v-for="y in [20,65,110,155,200]" x1="0" :y1="y" x2="700" :y2="y" /></g>
+                      <path class="area" d="M0,200 C90,196 120,184 180,182 S280,164 340,164 S440,140 520,132 S620,55 700,38 L700,220 L0,220 Z" />
+                      <path class="line-main" d="M0,200 C90,196 120,184 180,182 S280,164 340,164 S440,140 520,132 S620,55 700,38" />
+                      <path class="line-second" d="M0,200 C100,198 140,190 205,188 S305,171 370,167 S485,132 555,128 S650,82 700,74" />
+                      <path class="line-third" d="M0,200 C130,199 175,194 240,192 S360,175 430,170 S570,145 700,128" />
+                    </svg>
+                    <div class="x-labels"><span>7月1日</span><span>7月7日</span><span>7月13日</span><span>7月19日</span><span>7月25日</span><span>7月31日</span></div>
+                  </div>
+                </article>
+
+                <article class="panel grade-panel overview-link" role="button" tabindex="0" @click="openCustomerList()" @keydown.enter="openCustomerList()">
+                  <div class="panel-head"><div><h2>客户等级构成</h2><p>当前有效客资</p></div><span class="detail-chip">查看全部 →</span></div>
+                  <div class="activity-wrap">
+                    <div class="activity-rings" aria-label="客户等级占比圆环">
+                      <svg viewBox="0 0 190 190" aria-hidden="true">
+                        <defs>
+                          <linearGradient id="ring-a" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff2d55"/><stop offset="1" stop-color="#ff7a8f"/></linearGradient>
+                          <linearGradient id="ring-b" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff9500"/><stop offset="1" stop-color="#ffd60a"/></linearGradient>
+                          <linearGradient id="ring-c" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0a84ff"/><stop offset="1" stop-color="#64d2ff"/></linearGradient>
+                          <linearGradient id="ring-d" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5e5ce6"/><stop offset="1" stop-color="#bf5af2"/></linearGradient>
+                        </defs>
+                        <g class="activity-ring-set" transform="rotate(-90 95 95)">
+                          <circle class="activity-track" cx="95" cy="95" r="68"></circle>
+                          <circle v-for="item in gradeStats.filter(item => item.ratio)" :key="item.grade" class="activity-progress" :class="`ring-${item.grade.toLowerCase()}`" cx="95" cy="95" r="68" pathLength="100" :stroke-dasharray="`${item.arc} ${100 - item.arc}`" :stroke-dashoffset="-item.start"></circle>
+                        </g>
+                      </svg>
+                      <div class="activity-center"><strong v-text="customers.length"></strong><span>全部客户</span></div>
+                    </div>
+                  </div>
+                  <div class="grade-list"><button v-for="item in gradeStats" :key="item.grade" @click.stop="openCustomerList({ grade: item.grade })"><i :class="`grade-${item.grade.toLowerCase()}`"></i><span v-text="`${item.grade} 级客户`"></span><strong v-text="item.value"></strong><small v-text="item.percent"></small></button></div>
+                </article>
+              </div>
+
+              <div class="overview-summary-grid">
+                <article class="panel summary-panel region-summary overview-link" role="button" tabindex="0" @click="switchPage('heatmap')" @keydown.enter="switchPage('heatmap')">
+                  <div class="panel-head"><div><h2>地区客资分布</h2><p v-text="`${customers.length} 条客资覆盖 ${provinceData.length} 个省份`"></p></div><span class="detail-chip">查看热力图 →</span></div>
+                  <div class="region-bars">
+                    <div v-for="(area, index) in topRegions" :key="area.name"><span class="rank" v-text="index + 1"></span><strong v-text="area.name"></strong><i><b :style="{ width: `${area.value / topRegions[0].value * 100}%` }"></b></i><em v-text="`${area.value}条`"></em></div>
+                  </div>
+                </article>
+
+                <article class="panel summary-panel progress-summary overview-link" role="button" tabindex="0" @click="openCustomerList()" @keydown.enter="openCustomerList()">
+                  <div class="panel-head"><div><h2>项目阶段分布</h2><p>从前期接洽到最终成交</p></div><span class="detail-chip">查看项目 →</span></div>
+                  <div class="stage-list">
+                    <button v-for="stage in progressBuckets" :key="stage.label" @click.stop="openStage(stage)">
+                      <div><i :style="{ background: stage.color }"></i><span v-text="stage.label"></span><strong v-text="stage.value"></strong></div>
+                      <span class="stage-track"><i :style="{ width: `${customers.length ? stage.value / customers.length * 100 : 0}%`, background: stage.color }"></i></span>
+                      <small v-text="`${customers.length ? Math.round(stage.value / customers.length * 100) : 0}%`"></small>
+                    </button>
+                  </div>
+                </article>
+
+                <article class="panel summary-panel task-summary overview-link" role="button" tabindex="0" @click="switchPage('followups')" @keydown.enter="switchPage('followups')">
+                  <div class="panel-head"><div><h2>跟进任务概况</h2><p>共 5 项任务</p></div><span class="detail-chip">进入任务 →</span></div>
+                  <div class="task-overview">
+                    <div><span class="task-ring today">2</span><p><strong>今日待跟进</strong><small>需要按时处理</small></p></div>
+                    <div><span class="task-ring tomorrow">2</span><p><strong>明日计划</strong><small>提前准备资料</small></p></div>
+                    <div><span class="task-ring overdue">1</span><p><strong>已逾期</strong><small>建议优先处理</small></p></div>
+                  </div>
+                </article>
+              </div>
+            </section>
+
+            <section v-else-if="activePage === 'customers'" class="page list-page customer-wide-page">
+              <div class="page-heading customer-page-heading">
+                <div><p class="kicker">CUSTOMERS</p><h1 v-text="customerPageTitle"></h1><span v-text="customerPageSubtitle"></span></div>
+                <div class="customer-heading-actions">
+                  <div class="summary-line"><span>当前展示</span><strong v-text="filteredCustomers.length"></strong><span v-text="`条 · 总计 ${customers.length} 条`"></span></div>
+                  <div class="excel-actions">
+                    <input ref="excelInput" class="file-input" type="file" accept=".xlsx,.xls,.csv" @change="handleExcelImport" />
+                    <button class="excel-btn import-btn" @click="$refs.excelInput.click()"><span>⇧</span> 导入客资</button>
+                    <button class="excel-btn export-btn" @click="exportCustomersExcel"><span>⇩</span> 导出Excel</button>
+                  </div>
+                </div>
+              </div>
+              <section class="panel unified-filter-panel">
+              <article class="panel filter-panel"><div class="filter-row"><div class="custom-select-field" @click.stop><span>客户等级</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'filterGrade' }" @click="toggleRegionMenu('filterGrade')"><b v-text="customerGrade === 'all' ? '全部等级' : `${customerGrade} 级客户`"></b><i></i></button><div v-if="openRegionMenu === 'filterGrade'" class="custom-select-menu"><button type="button" :class="{ selected: customerGrade === 'all' }" @click="selectCustomerFilter('customerGrade', 'all')"><span>全部等级</span><small v-text="customers.length"></small><i>✓</i></button><button v-for="option in gradeFilterOptions" :key="option.value" type="button" :class="{ selected: customerGrade === option.value }" @click="selectCustomerFilter('customerGrade', option.value)"><span v-text="option.label"></span><small v-text="option.count"></small><i>✓</i></button></div></div><div class="custom-select-field" @click.stop><span>客户来源</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'filterSource' }" @click="toggleRegionMenu('filterSource')"><b v-text="sourceFilter === 'all' ? '全部来源' : sourceFilter"></b><i></i></button><div v-if="openRegionMenu === 'filterSource'" class="custom-select-menu"><button type="button" :class="{ selected: sourceFilter === 'all' }" @click="selectCustomerFilter('sourceFilter', 'all')"><span>全部来源</span><small v-text="customers.length"></small><i>✓</i></button><button v-for="option in sourceFilterOptions" :key="option.value" type="button" :class="{ selected: sourceFilter === option.value }" @click="selectCustomerFilter('sourceFilter', option.value)"><span v-text="option.label"></span><small v-text="option.count"></small><i>✓</i></button></div></div><div class="custom-select-field" @click.stop><span>省份</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'filterProvince' }" @click="toggleRegionMenu('filterProvince')"><b v-text="provinceFilter === 'all' ? '全部省份' : provinceFilter"></b><i></i></button><div v-if="openRegionMenu === 'filterProvince'" class="custom-select-menu"><button type="button" :class="{ selected: provinceFilter === 'all' }" @click="selectFilterProvince('all')"><span>全部省份</span><small v-text="customers.length"></small><i>✓</i></button><button v-for="province in provinceOptions" :key="province.name" type="button" :class="{ selected: provinceFilter === province.name }" @click="selectFilterProvince(province.name)"><span v-text="province.name"></span><small v-text="province.count"></small><i>✓</i></button></div></div><div class="custom-select-field" @click.stop><span>城市</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'filterCity' }" @click="toggleRegionMenu('filterCity')"><b v-text="cityFilter === 'all' ? (provinceFilter === 'all' ? '全部城市' : '该省全部城市') : cityFilter"></b><i></i></button><div v-if="openRegionMenu === 'filterCity'" class="custom-select-menu"><button type="button" :class="{ selected: cityFilter === 'all' }" @click="selectFilterCity('all')"><span v-text="provinceFilter === 'all' ? '全部城市' : '该省全部城市'"></span><small v-text="provinceFilter === 'all' ? customers.length : filteredCustomers.length"></small><i>✓</i></button><button v-for="city in cityOptions" :key="city.name" type="button" :class="{ selected: cityFilter === city.name }" @click="selectFilterCity(city.name)"><span v-text="city.name"></span><small v-text="city.count"></small><i>✓</i></button></div></div><div class="custom-select-field" @click.stop><span>项目阶段</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'filterProgress' }" @click="toggleRegionMenu('filterProgress')"><b v-text="progressFilter === 'all' ? '全部阶段' : progressFilterOptions.find(option => option.value === progressFilter)?.label"></b><i></i></button><div v-if="openRegionMenu === 'filterProgress'" class="custom-select-menu"><button type="button" :class="{ selected: progressFilter === 'all' }" @click="selectCustomerFilter('progressFilter', 'all')"><span>全部阶段</span><small v-text="customers.length"></small><i>✓</i></button><button v-for="option in progressFilterOptions" :key="option.value" type="button" :class="{ selected: progressFilter === option.value }" @click="selectCustomerFilter('progressFilter', option.value)"><span v-text="option.label"></span><small v-text="option.count"></small><i>✓</i></button></div></div><button class="ghost-btn" @click="resetFilters">重置筛选</button></div></article>
+              <div class="date-filter-panel">
+                <div class="date-filter-copy"><span>新建时间</span><strong>按客资录入日期筛选</strong></div>
+                <label><span>开始日期</span><input v-model="dateFrom" type="date" :max="dateTo || undefined" /></label>
+                <span class="date-range-arrow">→</span>
+                <label><span>结束日期</span><input v-model="dateTo" type="date" :min="dateFrom || undefined" /></label>
+                <button type="button" class="date-shortcut" @click="setRecentDateRange(30)">近30天</button>
+                <button v-if="dateFrom || dateTo" type="button" class="date-clear" @click="clearDateRange">清除时间</button>
+              </div>
+              </section>
+              <div class="customer-records">
+                <article v-for="customer in filteredCustomers" :key="customer.id || customer.phone" class="panel customer-record" role="button" tabindex="0" @click="openCustomerEdit(customer)" @keydown.enter="openCustomerEdit(customer)">
+                  <div class="record-topline">
+                    <span :class="`customer-grade-block grade-block-${customer.grade.toLowerCase()}`" v-text="customer.grade"></span>
+                    <div class="record-identity"><strong v-text="customer.name"></strong><a :href="`tel:${customer.phone}`" @click.stop v-text="customer.phone"></a><small class="record-created" v-text="`新建于 ${customer.created || customer.createdDate || '时间待补充'}`"></small></div>
+                    <div class="record-source"><span>客资来源</span><strong v-text="customer.source"></strong><small v-if="customer.referrer" v-text="`介绍人：${customer.referrer}`"></small></div>
+                    <div class="record-location"><span>省 / 市 / 区</span><div><b v-text="locationParts(customer).province"></b><b v-text="locationParts(customer).city"></b><b v-text="locationParts(customer).district"></b></div></div>
+                    <div class="record-progress"><span>项目进度</span><strong><i></i><b v-text="customer.progress"></b></strong></div>
+                    <div class="record-owner"><span>商务负责人</span><strong v-text="customer.owner"></strong></div>
+                    <div class="record-owner"><span>技术负责人</span><strong v-text="customer.tech"></strong></div>
+                    <button class="record-more" title="编辑客资" @click.stop="openCustomerEdit(customer)">···</button>
+                  </div>
+                  <div class="record-details">
+                    <section class="description-field"><span>客户描述</span><p v-text="customerDescription(customer)"></p></section>
+                    <section class="plan-field"><span>施工方案</span><p v-text="customer.plan || '暂未制定施工方案'"></p></section>
+                  </div>
+                </article>
+                <div v-if="!filteredCustomers.length" class="panel empty-state customer-empty"><span>⌕</span><strong>没有找到匹配客资</strong><p>请尝试其他关键词或点击“重置筛选”</p></div>
+              </div>
+            </section>
+
+            <section v-else-if="activePage === 'heatmap'" class="page map-page">
+              <div class="page-heading"><div><p class="kicker">CUSTOMER MAP</p><h1>全国客户热力图</h1><span>直观看到各省市客户体量与等级分布</span></div><div class="grade-tabs"><button v-for="grade in mapGrades" :class="{ active: mapGrade === grade.id }" @click="setMapGrade(grade.id)" v-text="grade.label"></button></div></div>
+              <div class="map-layout">
+                <article class="panel map-panel"><div class="map-toolbar"><div><strong v-text="mapGradeLabel"></strong><span>颜色越深，客户体量越大；点击省份查看对应客资</span></div><span class="live-dot"><i></i>模拟数据</span></div><div ref="mapEl" class="map-canvas"></div><div v-if="mapError" class="map-error"><span>!</span><strong>地图加载失败</strong><p v-text="mapError"></p><button @click="retryMap">重新加载</button></div></article>
+                <aside class="map-insights"><article class="panel map-total"><span>当前筛选客户</span><strong v-text="mapTotal"></strong><small v-text="`覆盖全国 ${provinceData.length} 个省级地区`"></small><div class="mini-stats"><div v-for="area in topAreaStats" :key="area.name"><b v-text="area.percent"></b><span v-text="`${area.name}占比`"></span></div></div></article><article class="panel ranking"><div class="panel-head"><div><h2>客户地区排行</h2><p>按当前等级统计</p></div></div><ol><li v-for="(area, index) in rankedAreas" :key="area.name"><span v-text="index + 1"></span><div><strong v-text="area.name"></strong><i><b :style="{ width: `${area.value / rankedAreas[0].value * 100}%` }"></b></i></div><em v-text="area.value"></em></li></ol></article><article class="map-tip"><span>↗</span><p><strong>地图可交互</strong>悬浮查看省份数据，点击省份可进入地区客资列表。</p></article></aside>
+              </div>
+            </section>
+
+            <section v-else-if="activePage === 'followups'" class="page followup-page">
+              <div class="page-heading followup-heading">
+                <div><p class="kicker">FOLLOW UPS</p><h1 v-text="followUpCanViewAll ? '全员跟进任务' : '我的跟进任务'"></h1><span>根据项目当前进度自动安排下一步工作，完成任务后同步推进项目</span></div>
+                <div v-if="followUpCanViewAll" class="custom-select-field follow-employee-filter" @click.stop><span>查看员工</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'followEmployee' }" @click="toggleRegionMenu('followEmployee')"><b v-text="followUpEmployeeLabel"></b><i></i></button><div v-if="openRegionMenu === 'followEmployee'" class="custom-select-menu employee-menu"><button type="button" :class="{ selected: followUpEmployeeFilter === 'all' }" @click="selectFollowUpEmployee('all')"><span><b>全部员工</b><small>查看公司全部关联项目</small></span><i>✓</i></button><button v-for="employee in followUpEmployees" :key="employee.id" type="button" :class="{ selected: String(followUpEmployeeFilter) === String(employee.id) }" @click="selectFollowUpEmployee(employee.id)"><span><b v-text="employee.name"></b><small v-text="employee.username"></small></span><i>✓</i></button></div></div>
+              </div>
+              <div class="follow-summary-grid">
+                <article class="panel follow-summary-card" :class="{ active: followStatusFilter === 'pending' }" role="button" tabindex="0" @click="setFollowStatus('pending')" @keydown.enter="setFollowStatus('pending')"><span class="follow-summary-icon blue">待</span><div><small>待跟进</small><strong v-text="followVisibleSummary.pending"></strong><p>未逾期、等待处理</p></div></article>
+                <article class="panel follow-summary-card" :class="{ active: followStatusFilter === 'overdue' }" role="button" tabindex="0" @click="setFollowStatus('overdue')" @keydown.enter="setFollowStatus('overdue')"><span class="follow-summary-icon red">期</span><div><small>已逾期</small><strong v-text="followVisibleSummary.overdue"></strong><p>需要优先处理</p></div></article>
+                <article class="panel follow-summary-card" :class="{ active: followStatusFilter === 'waiting' }" role="button" tabindex="0" @click="setFollowStatus('waiting')" @keydown.enter="setFollowStatus('waiting')"><span class="follow-summary-icon orange">等</span><div><small>等待客户</small><strong v-text="followVisibleSummary.waiting"></strong><p>等待反馈或资料</p></div></article>
+                <article class="panel follow-summary-card" :class="{ active: followStatusFilter === 'completed' }" role="button" tabindex="0" @click="setFollowStatus('completed')" @keydown.enter="setFollowStatus('completed')"><span class="follow-summary-icon green">完</span><div><small>已完成</small><strong v-text="followVisibleSummary.completed"></strong><p>已记录跟进结果</p></div></article>
+              </div>
+              <article class="panel follow-filter-panel">
+                <header><div><strong>筛选跟进项目</strong><span v-text="`当前显示 ${filteredFollowUpTasks.length} 个项目 · ${followStatusLabel}`"></span></div><button v-if="followStatusFilter !== 'all'" type="button" class="follow-status-clear" @click="setFollowStatus('all')">查看全部状态 ×</button></header>
+                <div class="follow-filter-row">
+                  <div class="custom-select-field" @click.stop><span>客户等级</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'followGrade' }" @click="toggleRegionMenu('followGrade')"><b v-text="followGradeFilter === 'all' ? '全部等级' : `${followGradeFilter} 级客户`"></b><i></i></button><div v-if="openRegionMenu === 'followGrade'" class="custom-select-menu"><button type="button" :class="{ selected: followGradeFilter === 'all' }" @click="selectCustomerFilter('followGradeFilter', 'all')"><span>全部等级</span><small v-text="followUpTasks.length"></small><i>✓</i></button><button v-for="option in followGradeOptions" :key="option.value" type="button" :class="{ selected: followGradeFilter === option.value }" @click="selectCustomerFilter('followGradeFilter', option.value)"><span v-text="option.label"></span><small v-text="option.count"></small><i>✓</i></button></div></div>
+                  <div class="custom-select-field" @click.stop><span>客资来源</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'followSource' }" @click="toggleRegionMenu('followSource')"><b v-text="followSourceFilter === 'all' ? '全部来源' : followSourceFilter"></b><i></i></button><div v-if="openRegionMenu === 'followSource'" class="custom-select-menu"><button type="button" :class="{ selected: followSourceFilter === 'all' }" @click="selectCustomerFilter('followSourceFilter', 'all')"><span>全部来源</span><small v-text="followUpTasks.length"></small><i>✓</i></button><button v-for="option in followSourceOptions" :key="option.value" type="button" :class="{ selected: followSourceFilter === option.value }" @click="selectCustomerFilter('followSourceFilter', option.value)"><span v-text="option.label"></span><small v-text="option.count"></small><i>✓</i></button></div></div>
+                  <div class="custom-select-field" @click.stop><span>省份</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'followProvince' }" @click="toggleRegionMenu('followProvince')"><b v-text="followProvinceFilter === 'all' ? '全部省份' : followProvinceFilter"></b><i></i></button><div v-if="openRegionMenu === 'followProvince'" class="custom-select-menu"><button type="button" :class="{ selected: followProvinceFilter === 'all' }" @click="selectFollowProvince('all')"><span>全部省份</span><small v-text="followUpTasks.length"></small><i>✓</i></button><button v-for="province in followProvinceOptions" :key="province.name" type="button" :class="{ selected: followProvinceFilter === province.name }" @click="selectFollowProvince(province.name)"><span v-text="province.name"></span><small v-text="province.count"></small><i>✓</i></button></div></div>
+                  <div class="custom-select-field" @click.stop><span>城市</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'followCity' }" @click="toggleRegionMenu('followCity')"><b v-text="followCityFilter === 'all' ? (followProvinceFilter === 'all' ? '全部城市' : '该省全部城市') : followCityFilter"></b><i></i></button><div v-if="openRegionMenu === 'followCity'" class="custom-select-menu"><button type="button" :class="{ selected: followCityFilter === 'all' }" @click="selectFollowCity('all')"><span v-text="followProvinceFilter === 'all' ? '全部城市' : '该省全部城市'"></span><small v-text="followCityOptions.reduce((sum, item) => sum + item.count, 0)"></small><i>✓</i></button><button v-for="city in followCityOptions" :key="city.name" type="button" :class="{ selected: followCityFilter === city.name }" @click="selectFollowCity(city.name)"><span v-text="city.name"></span><small v-text="city.count"></small><i>✓</i></button></div></div>
+                  <div class="custom-select-field" @click.stop><span>项目阶段</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'followProgress' }" @click="toggleRegionMenu('followProgress')"><b v-text="followProgressFilter === 'all' ? '全部阶段' : followProgressFilter"></b><i></i></button><div v-if="openRegionMenu === 'followProgress'" class="custom-select-menu progress-stage-menu"><button type="button" :class="{ selected: followProgressFilter === 'all' }" @click="selectCustomerFilter('followProgressFilter', 'all')"><span><b>全部阶段</b><small>查看所有项目进度</small></span><i>✓</i></button><button v-for="option in followProgressOptions" :key="option.value" type="button" :class="{ selected: followProgressFilter === option.value }" @click="selectCustomerFilter('followProgressFilter', option.value)"><span><b v-text="option.label"></b><small v-text="`${option.count} 个项目`"></small></span><i>✓</i></button></div></div>
+                  <button type="button" class="ghost-btn" @click="resetFollowFilters">重置筛选</button>
+                </div>
+              </article>
+              <div v-if="followUpError" class="panel follow-error"><strong>任务加载失败</strong><span v-text="followUpError"></span><button @click="loadFollowUpTasks">重新加载</button></div>
+              <div v-else class="follow-kanban" :class="{ 'single-column': followStatusFilter !== 'all' }">
+                <article v-for="column in followTaskColumns" :key="column.key" class="panel follow-column" :class="{ expanded: followStatusFilter !== 'all' }">
+                  <header><div><i :class="column.tone"></i><strong v-text="column.title"></strong></div><span v-text="column.items.length"></span></header>
+                  <div v-if="!column.items.length" class="follow-empty"><span>✓</span><p>暂无任务</p></div>
+                  <article v-for="task in column.visibleItems" :key="task.id" class="follow-task-card" :data-follow-task-id="task.id" :class="{ overdue: task.isOverdue, 'suggested-focus': highlightFollowTaskId === task.id }" role="button" tabindex="0" @click="openProjectDetail(task)" @keydown.enter.self="openProjectDetail(task)">
+                    <div class="follow-card-meta"><span :class="`grade grade-${task.project.customer.grade.toLowerCase()}`" v-text="`${task.project.customer.grade}级`"></span><em :class="task.role" v-text="task.roleLabel"></em><small v-text="task.dueLabel"></small></div>
+                    <h3 v-text="task.project.customer.name"></h3>
+                    <p class="follow-project-name" v-text="task.project.name"></p>
+                    <div class="follow-progress-path"><span v-text="task.project.progress"></span><b>→</b><strong v-text="task.targetProgress"></strong></div>
+                    <p class="follow-task-title" v-text="task.title"></p>
+                    <div class="follow-assignee"><span>负责人</span><strong v-text="task.assignee.name"></strong></div>
+                    <p v-if="task.status === 'completed' && task.result" class="follow-result" v-text="task.result"></p>
+                    <footer v-if="task.status !== 'completed'"><button v-if="task.status === 'waiting'" class="ghost-btn" @click.stop="updateFollowTask(task, 'pending')">恢复待办</button><button v-else class="ghost-btn" @click.stop="updateFollowTask(task, 'waiting')">等待客户</button><button class="primary-btn" @click.stop="openTaskCompleteDialog(task)">完成并推进</button></footer>
+                  </article>
+                  <button v-if="column.canToggle" type="button" class="follow-column-toggle" @click="toggleFollowColumn(column.key)"><span v-text="column.isExpanded ? '收起项目列表' : `展开剩余 ${column.hiddenCount} 个项目`"></span><i :class="{ expanded: column.isExpanded }"></i></button>
+                </article>
+              </div>
+            </section>
+
+            <section v-else class="page tomorrow-page">
+              <div class="page-heading tomorrow-heading">
+                <div><p class="kicker">TOMORROW</p><h1>明日安排</h1><span>系统建议与个人计划分开整理，提前明确明天需要推进的工作</span></div>
+                <div class="tomorrow-date"><span>计划日期</span><strong v-text="tomorrowDateLabel"></strong></div>
+              </div>
+              <div class="tomorrow-board">
+                <article class="panel tomorrow-column system-column">
+                  <header class="tomorrow-column-head"><div><span class="tomorrow-column-icon system">荐</span><p><strong>系统建议</strong><small>根据关联项目和跟进任务自动整理</small></p></div><b v-text="systemTomorrowSuggestions.length"></b></header>
+                  <div v-if="followUpLoading" class="tomorrow-loading">正在分析关联项目…</div>
+                  <div v-else-if="followUpError" class="tomorrow-inline-error"><strong>系统建议加载失败</strong><span v-text="followUpError"></span><button @click="loadFollowUpTasks">重新加载</button></div>
+                  <div v-else-if="systemTomorrowSuggestions.length" class="tomorrow-list">
+                    <article v-for="task in systemTomorrowSuggestions" :key="task.id" class="system-suggestion" :class="{ urgent: task.isOverdue, tomorrow: task.isTomorrow }" role="button" tabindex="0" @click="openSuggestionDetail(task)" @keydown.enter="openSuggestionDetail(task)">
+                      <div class="suggestion-mark"><i></i><span v-text="task.isOverdue ? '急' : task.isTomorrow ? '明' : '备'"></span></div>
+                      <div class="suggestion-main"><div><strong v-text="task.title"></strong><em v-text="task.reason"></em></div><p v-text="`${task.project.customer.name} · ${task.project.name}`"></p><footer><span v-text="`目标：${task.targetProgress}`"></span><b v-text="`${task.roleLabel} · ${task.assignee.name}`"></b></footer></div>
+                    </article>
+                  </div>
+                  <div v-else class="tomorrow-empty"><span>✓</span><strong>明日暂无系统建议</strong><p>当前账号没有需要优先推进的关联项目。</p></div>
+                </article>
+
+                <article class="panel tomorrow-column personal-column">
+                  <header class="tomorrow-column-head"><div><span class="tomorrow-column-icon personal">我</span><p><strong>我的事项</strong><small>仅当前登录账号可以查看和修改</small></p></div><b v-text="unfinishedTomorrowItems"></b></header>
+                  <form class="tomorrow-add-form" @submit.prevent="addTomorrowItem">
+                    <input v-model="newTomorrowTitle" maxlength="160" placeholder="写下明天要完成的事情…" />
+                    <textarea v-model="newTomorrowNote" rows="2" placeholder="补充说明（选填）"></textarea>
+                    <button type="submit" class="primary-btn" :disabled="tomorrowSaving" v-text="tomorrowSaving ? '正在保存…' : '加入明日安排'"></button>
+                  </form>
+                  <div v-if="tomorrowError" class="tomorrow-inline-error"><strong>个人事项加载失败</strong><span v-text="tomorrowError"></span><button @click="loadTomorrowItems">重新加载</button></div>
+                  <div v-else-if="tomorrowItems.length" class="tomorrow-list personal-list">
+                    <article v-for="item in tomorrowItems" :key="item.id" class="personal-tomorrow-item" :class="{ completed: item.isCompleted }">
+                      <button type="button" class="tomorrow-check" :aria-label="item.isCompleted ? '恢复未完成' : '标记完成'" @click="toggleTomorrowItem(item)"><span>✓</span></button>
+                      <div><strong v-text="item.title"></strong><p v-if="item.note" v-text="item.note"></p><small v-text="item.isCompleted ? '已完成' : '待完成'"></small></div>
+                      <button type="button" class="tomorrow-delete" title="删除事项" @click="deleteTomorrowItem(item)">×</button>
+                    </article>
+                  </div>
+                  <div v-else-if="!tomorrowLoading" class="tomorrow-empty personal-empty"><span>＋</span><strong>还没有个人事项</strong><p>在上方写下明天需要自己完成的工作。</p></div>
+                </article>
+              </div>
+            </section>
+          </div>
+
+          <nav class="mobile-nav"><button v-for="item in navItems" :class="{ active: activePage === item.id }" @click="switchPage(item.id)"><span v-text="item.icon"></span><small v-text="item.label"></small></button></nav>
+        </main>
+
+        <div v-if="showCreate" class="modal-backdrop" @click.self="showCreate = false">
+          <form class="create-modal" @submit.prevent="addCustomer">
+            <header><div><p class="kicker">NEW CUSTOMER</p><h2>新建客资</h2></div><button type="button" @click="showCreate = false">×</button></header>
+            <div class="form-grid"><label><span>客户名称</span><input v-model="newCustomer.name" required placeholder="请输入客户名称" /></label><label><span>称呼</span><input v-model="newCustomer.call" placeholder="如：张总、李工" /></label><label><span>联系电话</span><input v-model="newCustomer.phone" required placeholder="请输入联系电话" /></label><label><span>客户来源</span><select v-model="newCustomer.source"><option>抖音</option><option>视频号</option><option>朋友介绍</option></select></label><label v-if="newCustomer.source === '朋友介绍'" class="referrer-field"><span>介绍人 <b>必填</b></span><input v-model="newCustomer.referrer" required placeholder="请输入介绍人姓名或称呼" /></label><label><span>省市区</span><input v-model="newCustomer.region" placeholder="如：浙江省 杭州市" /></label><label><span>客户等级</span><select v-model="newCustomer.grade"><option>A</option><option>B</option><option>C</option><option>D</option></select></label><label><span>项目进度</span><select v-model="newCustomer.progress"><option v-for="stage in progressStages" :key="stage" :value="stage" v-text="stage"></option></select></label><label><span>商务负责人</span><select v-model="newCustomer.ownerId" required><option value="" disabled v-text="employeeLoadError || '请选择商务负责人'"></option><option v-for="employee in employees.business" :key="employee.id" :value="employee.id" v-text="`${employee.display_name}（${employee.username}）`"></option></select></label><label><span>技术负责人</span><select v-model="newCustomer.techId" required><option value="" disabled v-text="employeeLoadError || '请选择技术负责人'"></option><option v-for="employee in employees.technical" :key="employee.id" :value="employee.id" v-text="`${employee.display_name}（${employee.username}）`"></option></select></label><label class="span-2"><span>施工方案</span><input v-model="newCustomer.plan" placeholder="请输入施工方案概要" /></label><label class="span-2"><span>客户描述</span><textarea v-model="newCustomer.description" rows="4" placeholder="请详细填写客户需求、项目情况、现场条件、沟通重点等信息……"></textarea></label></div>
+            <footer><button type="button" class="ghost-btn" @click="showCreate = false">取消</button><button class="primary-btn" type="submit">保存客资</button></footer>
+          </form>
+        </div>
+        <div v-if="showEdit" class="edit-backdrop" @mousedown.self="requestCloseEdit">
+          <form class="edit-drawer" @submit.prevent="saveCustomerEdit">
+            <header>
+              <div><p class="kicker">EDIT CUSTOMER</p><h2>修改客资信息</h2><span>修改后将同步更新列表、筛选统计和热力图</span></div>
+              <button type="button" aria-label="关闭" @click="requestCloseEdit">×</button>
+            </header>
+            <div class="edit-scroll">
+              <section class="edit-section">
+                <div class="edit-section-title"><span>01</span><div><strong>基础信息</strong><small>客户身份、来源与等级</small></div></div>
+                <div class="form-grid">
+                  <label><span>客户名称</span><input v-model="editCustomer.name" required placeholder="请输入客户名称" /></label>
+                  <label><span>联系电话</span><input v-model="editCustomer.phone" required placeholder="请输入联系电话" /></label>
+                  <label><span>客资来源</span><select v-model="editCustomer.source"><option v-if="!['抖音', '视频号', '朋友介绍'].includes(editCustomer.source)" :value="editCustomer.source" v-text="editCustomer.source"></option><option>抖音</option><option>视频号</option><option>朋友介绍</option></select></label>
+                  <label><span>客户等级</span><select v-model="editCustomer.grade"><option>A</option><option>B</option><option>C</option><option>D</option></select></label>
+                  <label v-if="editCustomer.source === '朋友介绍'" class="span-2 referrer-field"><span>介绍人 <b>必填</b></span><input v-model="editCustomer.referrer" required placeholder="请输入介绍人姓名或称呼" /></label>
+                </div>
+              </section>
+              <section class="edit-section">
+                <div class="edit-section-title"><span>02</span><div><strong>项目地区</strong><small>分别修改省、市、区信息</small></div></div>
+                <div class="form-grid location-edit-grid">
+                  <div class="custom-select-field edit-region-select" @click.stop><span>省份</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'editProvince' }" @click="toggleRegionMenu('editProvince')"><b v-text="editCustomer.province || regionLoadError || (regionTree.length ? '请选择省份' : '正在加载省份…')"></b><i></i></button><div v-if="openRegionMenu === 'editProvince'" class="custom-select-menu"><button v-for="province in editProvinceOptions" :key="province.code" type="button" :class="{ selected: editCustomer.province === province.name }" @click="selectEditProvince(province.name)"><span v-text="province.name"></span><i>✓</i></button></div></div>
+                  <div class="custom-select-field edit-region-select" :class="{ disabled: !editCustomer.province }" @click.stop><span>城市</span><button type="button" class="custom-select-trigger" :disabled="!editCustomer.province" :class="{ active: openRegionMenu === 'editCity' }" @click="toggleRegionMenu('editCity')"><b v-text="editCustomer.city || '请选择城市'"></b><i></i></button><div v-if="openRegionMenu === 'editCity'" class="custom-select-menu"><button v-for="city in editCityOptions" :key="city.code" type="button" :class="{ selected: editCustomer.city === city.name }" @click="selectEditCity(city.name)"><span v-text="city.name"></span><i>✓</i></button></div></div>
+                  <div class="custom-select-field edit-region-select" :class="{ disabled: !editCustomer.city }" @click.stop><span>区 / 县</span><button type="button" class="custom-select-trigger" :disabled="!editCustomer.city" :class="{ active: openRegionMenu === 'editDistrict' }" @click="toggleRegionMenu('editDistrict')"><b v-text="editCustomer.district || '请选择区 / 县'"></b><i></i></button><div v-if="openRegionMenu === 'editDistrict'" class="custom-select-menu"><button v-for="district in editDistrictOptions" :key="district.code" type="button" :class="{ selected: editCustomer.district === district.name }" @click="selectEditDistrict(district.name)"><span v-text="district.name"></span><i>✓</i></button></div></div>
+                </div>
+              </section>
+              <section class="edit-section">
+                <div class="edit-section-title"><span>03</span><div><strong>跟进与负责人</strong><small>同步客户当前项目状态</small></div></div>
+                <div class="form-grid follow-owner-grid">
+                  <div class="custom-select-field edit-region-select progress-stage-select" @click.stop><span>项目进度</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'editProgress' }" @click="toggleRegionMenu('editProgress')"><b v-text="editCustomer.progress || '请选择项目进度'"></b><i></i></button><div v-if="openRegionMenu === 'editProgress'" class="custom-select-menu progress-stage-menu"><button v-for="(stage, index) in progressStages" :key="stage" type="button" :class="{ selected: editCustomer.progress === stage }" @click="selectProgress('editCustomer', stage)"><span><b v-text="stage"></b><small v-text="index === 0 ? '初始状态' : `第 ${index} 个业务节点`"></small></span><i>✓</i></button></div></div>
+                  <div class="custom-select-field edit-region-select employee-select" @click.stop><span>商务负责人</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'businessOwner' }" @click="toggleRegionMenu('businessOwner')"><b v-text="editCustomer.owner || employeeLoadError || '请选择商务负责人'"></b><i></i></button><div v-if="openRegionMenu === 'businessOwner'" class="custom-select-menu employee-menu"><button v-for="employee in employees.business" :key="employee.id" type="button" :class="{ selected: editCustomer.ownerId === employee.id }" @click="selectEditEmployee('business', employee)"><span><b v-text="employee.display_name"></b><small v-text="employee.username"></small></span><i>✓</i></button><p v-if="!employees.business.length" v-text="employeeLoadError || '暂无可用的商务负责人账号'"></p></div></div>
+                  <div class="custom-select-field edit-region-select employee-select" @click.stop><span>技术负责人</span><button type="button" class="custom-select-trigger" :class="{ active: openRegionMenu === 'technicalOwner' }" @click="toggleRegionMenu('technicalOwner')"><b v-text="editCustomer.tech || employeeLoadError || '请选择技术负责人'"></b><i></i></button><div v-if="openRegionMenu === 'technicalOwner'" class="custom-select-menu employee-menu"><button v-for="employee in employees.technical" :key="employee.id" type="button" :class="{ selected: editCustomer.techId === employee.id }" @click="selectEditEmployee('technical', employee)"><span><b v-text="employee.display_name"></b><small v-text="employee.username"></small></span><i>✓</i></button><p v-if="!employees.technical.length" v-text="employeeLoadError || '暂无可用的技术负责人账号'"></p></div></div>
+                  <label class="span-3"><span>施工方案</span><textarea v-model="editCustomer.plan" rows="4" placeholder="请输入施工方案概要"></textarea></label>
+                  <label class="span-3 description-editor"><span>客户描述</span><textarea v-model="editCustomer.description" rows="7" placeholder="详细填写客户需求、项目情况、现场条件、施工面积、预计用量和沟通结果……"></textarea></label>
+                </div>
+              </section>
+              <section class="edit-section followup-history-section">
+                <div class="edit-section-title"><span>04</span><div><strong>跟进记录</strong><small>自动保存每次任务结果、负责人和项目进度变化</small></div><b v-if="!customerFollowUpsLoading" v-text="`${customerFollowUps.length} 条`"></b></div>
+                <div v-if="customerFollowUpsLoading" class="history-loading"><i></i><span>正在读取跟进记录…</span></div>
+                <div v-else-if="customerFollowUpsError" class="history-error"><strong>跟进记录加载失败</strong><span v-text="customerFollowUpsError"></span><button type="button" @click="loadCustomerFollowUps(customers[editingIndex].id)">重新加载</button></div>
+                <div v-else-if="customerFollowUps.length" class="customer-followup-list">
+                  <article v-for="task in customerFollowUps" :key="task.id" class="customer-followup-item" :class="{ completed: task.status === 'completed', overdue: task.isOverdue }">
+                    <i class="history-timeline-dot"></i>
+                    <div class="history-card">
+                      <header><div><span :class="`history-status ${task.status}`" v-text="task.statusLabel"></span><em v-text="task.roleLabel"></em></div><time v-text="task.completedLabel || task.updatedLabel"></time></header>
+                      <strong v-text="task.title"></strong>
+                      <small v-text="task.project.name"></small>
+                      <div class="history-progress"><span v-text="task.fromProgress"></span><b>→</b><strong v-text="task.targetProgress"></strong></div>
+                      <section v-if="task.result" class="history-result"><span>跟进结果</span><p v-text="task.result"></p></section>
+                      <section v-else class="history-result pending"><span>跟进结果</span><p>任务尚未完成，暂未填写跟进结果。</p></section>
+                      <footer><span>负责人</span><strong v-text="task.assignee.name"></strong><small v-text="task.completedLabel ? `完成于 ${task.completedLabel}` : `计划完成 ${task.dueLabel}`"></small></footer>
+                    </div>
+                  </article>
+                </div>
+                <div v-else class="history-empty"><span>记</span><strong>暂无跟进记录</strong><p>完成项目跟进任务后，填写的结果会自动显示在这里。</p></div>
+              </section>
+            </div>
+            <footer><button type="button" class="ghost-btn" @click="requestCloseEdit">取消</button><button type="submit" class="primary-btn" :disabled="savingEdit" v-text="savingEdit ? '正在保存…' : '保存修改'"></button></footer>
+          </form>
+          <transition name="confirm-pop">
+            <div v-if="showUnsavedConfirm" class="unsaved-confirm-layer">
+              <section class="unsaved-confirm" role="dialog" aria-modal="true" aria-labelledby="unsaved-title">
+                <span class="unsaved-icon">!</span>
+                <div><p class="kicker">UNSAVED CHANGES</p><h3 id="unsaved-title">是否保存本次修改？</h3><p>检测到客资信息已经发生变化。保存后将同步更新全部客资列表；不保存则放弃本次修改。</p></div>
+                <footer><button type="button" class="ghost-btn" @click="showUnsavedConfirm = false">继续编辑</button><button type="button" class="discard-btn" @click="discardCustomerEdit">不保存</button><button type="button" class="primary-btn" :disabled="savingEdit" @click="saveCustomerEdit" v-text="savingEdit ? '正在保存…' : '保存修改'"></button></footer>
+              </section>
+            </div>
+          </transition>
+        </div>
+        <div v-if="activeSuggestion" class="modal-backdrop suggestion-detail-backdrop" @mousedown.self="closeSuggestionDetail">
+          <section class="create-modal suggestion-detail-modal" role="dialog" aria-modal="true" aria-labelledby="suggestion-detail-title">
+            <header><div><p class="kicker" v-text="activeDetailMode === 'project' ? 'PROJECT DETAIL' : 'TASK DETAIL'"></p><h2 id="suggestion-detail-title" v-text="activeDetailMode === 'project' ? '项目详情' : '任务具体情况'"></h2><span v-text="activeDetailMode === 'project' ? '查看该任务关联的客户、项目方案、负责人和进度信息' : '核对关联客户与项目，并重点关注系统建议推进的内容'"></span></div><button type="button" aria-label="关闭" @click="closeSuggestionDetail">×</button></header>
+            <div class="suggestion-detail-body">
+              <section class="suggestion-customer-strip"><span :class="`grade grade-${activeSuggestion.project.customer.grade.toLowerCase()}`" v-text="`${activeSuggestion.project.customer.grade}级`"></span><div><strong v-text="activeSuggestion.project.customer.name"></strong><small v-text="activeSuggestion.project.customer.phone"></small></div><em v-text="activeSuggestion.statusLabel"></em></section>
+              <div class="suggestion-detail-grid">
+                <section><span>关联项目</span><strong v-text="activeSuggestion.project.name"></strong><small v-text="activeSuggestion.project.region || '项目地区待补充'"></small></section>
+                <section><span>计划完成时间</span><strong v-text="activeSuggestion.dueLabel"></strong><small v-text="activeSuggestion.isOverdue ? '当前任务已经逾期' : '请按计划时间推进'"></small></section>
+                <section><span>商务负责人</span><strong v-text="activeSuggestion.project.businessOwner.name"></strong><small>负责商务沟通与签约</small></section>
+                <section><span>技术负责人</span><strong v-text="activeSuggestion.project.technicalOwner.name"></strong><small>负责技术方案与实施支持</small></section>
+              </div>
+              <section class="suggestion-task-copy"><span>具体任务</span><strong v-text="activeSuggestion.title"></strong><p v-text="activeSuggestion.project.plan || '项目方案暂未补充'"></p></section>
+              <section class="suggested-change" :class="{ urgent: activeSuggestion.isOverdue }"><header><span v-text="activeDetailMode === 'project' ? '任务推进目标' : '系统建议修改'"></span><em v-text="activeSuggestion.reason"></em></header><div><p><small>当前项目进度</small><strong v-text="activeSuggestion.project.progress"></strong></p><b>→</b><p class="suggested-target"><small v-text="activeSuggestion.status === 'completed' ? '任务完成进度' : '建议推进至'"></small><strong v-text="activeSuggestion.targetProgress"></strong></p></div><footer v-text="activeSuggestion.status === 'completed' ? '该任务已经完成，右侧为本次任务对应的目标进度。' : '完成此任务后，系统将把项目进度更新为右侧高亮阶段。'"></footer></section>
+            </div>
+            <footer><button type="button" class="ghost-btn" @click="closeSuggestionDetail">关闭</button><button v-if="activeDetailMode === 'suggestion'" type="button" class="primary-btn" @click="openSuggestionFollowUp">进入跟进任务</button><button v-else-if="activeSuggestion.status !== 'completed'" type="button" class="primary-btn" @click="openDetailTaskComplete">完成并推进</button></footer>
+          </section>
+        </div>
+        <div v-if="showTaskComplete" class="modal-backdrop task-complete-backdrop" @mousedown.self="closeTaskCompleteDialog">
+          <form class="create-modal task-complete-modal" @submit.prevent="completeFollowTask">
+            <header><div><p class="kicker">COMPLETE TASK</p><h2>填写跟进结果</h2><span>完成后，项目会自动进入下一业务进度并生成后续任务</span></div><button type="button" @click="closeTaskCompleteDialog">×</button></header>
+            <div v-if="activeFollowTask" class="task-complete-context"><span v-text="activeFollowTask.project.customer.name"></span><strong v-text="activeFollowTask.title"></strong><small v-text="`${activeFollowTask.project.progress} → ${activeFollowTask.targetProgress}`"></small></div>
+            <label class="task-result-field"><span>本次跟进结果 <b>必填</b></span><textarea v-model="taskResult" rows="6" required placeholder="请填写沟通内容、客户反馈、确认结果及后续注意事项……"></textarea></label>
+            <footer><button type="button" class="ghost-btn" @click="closeTaskCompleteDialog">取消</button><button type="submit" class="primary-btn">完成任务并推进项目</button></footer>
+          </form>
+        </div>
+        <transition name="toast"><div v-if="toast" class="toast"><span>✓</span><div><strong>操作成功</strong><p v-text="toast"></p></div></div></transition>
+      </div>
+    </div>
+    <script src="{% static 'vue.global.prod.js' %}?v=3.5.39"></script>
+    <script src="{% static 'echarts.min.js' %}?v=6"></script>
+    <script src="{% static 'xlsx.full.min.js' %}?v=0.18.5"></script>
+    <script src="{% static 'app.js' %}?v=20260802-6"></script>
+  </body>
+</html>
