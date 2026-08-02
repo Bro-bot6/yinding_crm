@@ -27,4 +27,5 @@
 - `setup.bat`：新电脑首次安装与启动。
 - `run.bat`：日常启动网站。
 - `backup-data.bat`：备份当前数据库。
+- `push-to-gitee.bat`：将已经提交的代码上传到配置好的 Gitee 仓库。
 - `.env.example`：正式部署所需环境变量示例。
