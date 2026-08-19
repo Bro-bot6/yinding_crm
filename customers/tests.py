@@ -1,14 +1,618 @@
 import json
-from datetime import timedelta
+from datetime import date, timedelta
+from io import BytesIO
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
+from openpyxl import load_workbook
 
 from .admin import EmployeeUserCreationForm
-from .models import Customer, EmployeeProfile, FollowUpTask, Project, TomorrowItem
-from .services import PROGRESS_STAGES
+from .models import (
+    Customer,
+    EmployeeProfile,
+    FollowUpTask,
+    MaterialExperiment,
+    ProgressUpdateReadReceipt,
+    Project,
+    ProjectProgressUpdate,
+    ProjectType,
+    SchemeCalculation,
+    TomorrowItem,
+    VisitorRecord,
+)
+from .services import PROGRESS_STAGES, normalize_progress
+
+
+class ProjectTypeAndProgressUpdateApiTests(TestCase):
+    def setUp(self):
+        self.admin = get_user_model().objects.create_superuser(
+            username='overview-admin',
+            password='123456',
+        )
+        self.employee = get_user_model().objects.create_user(
+            username='overview-business',
+            password='123456',
+        )
+        EmployeeProfile.objects.create(
+            user=self.employee,
+            role=EmployeeProfile.Role.BUSINESS,
+        )
+        self.project_type = ProjectType.objects.get(name='道路')
+        self.customer = Customer.objects.create(
+            name='测试 A 类客户',
+            grade='A',
+            progress='需求对接',
+            business_owner=self.employee,
+        )
+        self.project = Project.objects.create(
+            customer=self.customer,
+            name='道路项目',
+            project_type=self.project_type,
+            business_owner=self.employee,
+        )
+
+    def test_only_superuser_can_manage_project_types(self):
+        self.client.force_login(self.employee)
+        denied = self.client.post(
+            reverse('project-types'),
+            data=json.dumps({'name': '厂房地坪'}),
+            content_type='application/json',
+        )
+        self.assertEqual(denied.status_code, 403)
+
+        self.client.force_login(self.admin)
+        created = self.client.post(
+            reverse('project-types'),
+            data=json.dumps({'name': '厂房地坪'}),
+            content_type='application/json',
+        )
+        self.assertEqual(created.status_code, 201)
+        archived = self.client.delete(
+            reverse('project-type-detail', args=(created.json()['projectType']['id'],)),
+        )
+        self.assertEqual(archived.status_code, 200)
+        self.assertFalse(archived.json()['projectType']['isActive'])
+
+    def test_ab_project_owner_can_add_update_and_unread_can_be_cleared(self):
+        self.client.force_login(self.employee)
+        created = self.client.post(
+            reverse('progress-updates'),
+            data=json.dumps({'projectId': self.project.id, 'content': '完成现场测量，明日整理参数。'}),
+            content_type='application/json',
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(ProjectProgressUpdate.objects.count(), 1)
+
+        overview = self.client.get(reverse('progress-updates')).json()
+        self.assertEqual(overview['total'], 1)
+        self.assertEqual(overview['unreadCount'], 1)
+        self.client.post(reverse('mark-progress-updates-read'))
+        self.assertEqual(self.client.get(reverse('progress-updates')).json()['unreadCount'], 0)
+
+    def test_progress_updates_are_grouped_by_business_or_technical_nature(self):
+        technical = get_user_model().objects.create_user(
+            username='overview-technical',
+            password='123456',
+        )
+        EmployeeProfile.objects.create(
+            user=technical,
+            role=EmployeeProfile.Role.TECHNICAL,
+            technical_level=4,
+        )
+        self.project.technical_owner = technical
+        self.project.save(update_fields=('technical_owner',))
+        ProjectProgressUpdate.objects.create(
+            project=self.project,
+            content='商务沟通更新',
+            created_by=self.employee,
+        )
+        technical_update = ProjectProgressUpdate.objects.create(
+            project=self.project,
+            content='技术方案更新',
+            created_by=technical,
+        )
+
+        self.client.force_login(self.admin)
+        updates = self.client.get(reverse('progress-updates')).json()['updates']
+        payload = {item['id']: item for item in updates}
+
+        self.assertEqual(payload[technical_update.id]['updateNature'], 'technical')
+        self.assertEqual(payload[technical_update.id]['updateGroup']['natureLabel'], '技术')
+        self.assertEqual(payload[technical_update.id]['updateGroup']['level'], 4)
+        business_update = next(item for item in updates if item['content'] == '商务沟通更新')
+        self.assertEqual(business_update['updateGroup']['nature'], 'business')
+
+    def test_project_update_can_be_read_from_customer_and_edited(self):
+        item = ProjectProgressUpdate.objects.create(
+            project=self.project,
+            content='首次进度记录',
+            created_by=self.employee,
+        )
+        self.client.force_login(self.employee)
+
+        detail = self.client.get(reverse('customer-detail', args=(self.customer.id,)))
+        self.assertEqual(detail.status_code, 200)
+        record = detail.json()['progressUpdates'][0]
+        self.assertEqual(record['content'], '首次进度记录')
+        self.assertTrue(record['canEdit'])
+        self.assertIn('createdLabel', record)
+        self.assertIn('updatedLabel', record)
+
+        edited = self.client.patch(
+            reverse('progress-update-detail', args=(item.id,)),
+            data=json.dumps({'content': '已补充现场测量数据'}),
+            content_type='application/json',
+        )
+        self.assertEqual(edited.status_code, 200)
+        self.assertEqual(edited.json()['update']['content'], '已补充现场测量数据')
+        item.refresh_from_db()
+        self.assertEqual(item.content, '已补充现场测量数据')
+
+        deleted = self.client.delete(reverse('progress-update-detail', args=(item.id,)))
+        self.assertEqual(deleted.status_code, 200)
+        self.assertTrue(deleted.json()['deleted'])
+        self.assertFalse(ProjectProgressUpdate.objects.filter(id=item.id).exists())
+
+    def test_small_progress_node_keeps_formal_stage_and_validates_adjacent_interval(self):
+        self.client.force_login(self.employee)
+        occurred_at = '2026-08-16T09:35:00+08:00'
+        created = self.client.post(
+            reverse('progress-updates'),
+            data=json.dumps({
+                'projectId': self.project.id,
+                'content': '已协调寄样时间，等待物流单号。',
+                'fromProgress': '技术验证',
+                'toProgress': '客户深度沟通',
+                'occurredAt': occurred_at,
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(created.status_code, 201)
+        payload = created.json()['update']
+        self.assertEqual(payload['intervalLabel'], '技术验证 → 客户深度沟通')
+        self.assertTrue(payload['occurredAt'].startswith('2026-08-16T09:35:00'))
+        self.customer.refresh_from_db()
+        self.project.refresh_from_db()
+        self.assertEqual(self.customer.progress, '需求对接')
+        self.assertEqual(self.project.progress, '需求对接')
+
+        invalid = self.client.post(
+            reverse('progress-updates'),
+            data=json.dumps({
+                'projectId': self.project.id,
+                'content': '错误的跨阶段区间',
+                'fromProgress': '需求对接',
+                'toProgress': '方案与报价',
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(invalid.status_code, 400)
+
+    def test_material_experiment_is_saved_and_returned_in_customer_detail(self):
+        self.client.force_login(self.employee)
+        saved = self.client.put(
+            reverse('material-experiment', args=(self.customer.id,)),
+            data=json.dumps({
+                'stableMaterial': '现场素土',
+                'day7Data': '无侧限抗压强度 2.1MPa',
+                'day14Data': '无侧限抗压强度 3.4MPa',
+                'day28Data': '待检测',
+                'technicalMessage': '建议保持当前掺比继续观察。',
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertTrue(MaterialExperiment.objects.filter(project=self.project).exists())
+        detail = self.client.get(reverse('customer-detail', args=(self.customer.id,)))
+        self.assertEqual(detail.status_code, 200)
+        experiment = detail.json()['materialExperiment']
+        self.assertEqual(experiment['stableMaterial'], '现场素土')
+        self.assertEqual(experiment['day28Data'], '待检测')
+        self.assertTrue(experiment['canEdit'])
+        self.assertIn('visitorRecords', detail.json())
+        self.assertIn('schemeCalculation', detail.json())
+
+    def test_update_can_be_archived_as_read_for_current_account(self):
+        item = ProjectProgressUpdate.objects.create(
+            project=self.project,
+            content='等待领导查看的项目进展',
+            created_by=self.employee,
+        )
+        self.client.force_login(self.employee)
+
+        marked = self.client.post(reverse('mark-progress-update-read', args=(item.id,)))
+        self.assertEqual(marked.status_code, 200)
+        self.assertTrue(marked.json()['read'])
+        self.assertTrue(ProgressUpdateReadReceipt.objects.filter(
+            user=self.employee,
+            progress_update=item,
+        ).exists())
+
+        overview = self.client.get(reverse('progress-updates')).json()
+        self.assertEqual(overview['total'], 1)
+        self.assertEqual(overview['updates'], [])
+        self.assertEqual(overview['readUpdates'][0]['id'], item.id)
+        self.assertEqual(overview['periodUpdates'][0]['id'], item.id)
+
+    def test_cd_customer_cannot_receive_progress_update(self):
+        self.customer.grade = 'C'
+        self.customer.save(update_fields=('grade',))
+        self.client.force_login(self.employee)
+        response = self.client.post(
+            reverse('progress-updates'),
+            data=json.dumps({'projectId': self.project.id, 'content': '不应保存'}),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(ProjectProgressUpdate.objects.count(), 0)
+
+    def test_customer_payload_updates_primary_project_type(self):
+        self.client.force_login(self.admin)
+        water = ProjectType.objects.get(name='水利')
+        response = self.client.patch(
+            reverse('customer-detail', args=(self.customer.id,)),
+            data=json.dumps({
+                'name': self.customer.name,
+                'phone': '',
+                'source': '抖音',
+                'province': '浙江省',
+                'city': '杭州市',
+                'district': '西湖区',
+                'grade': 'A',
+                'description': '',
+                'progress': '需求对接',
+                'plan': '水利项目方案',
+                'projectTypeId': water.id,
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.project_type, water)
+        self.assertEqual(response.json()['customer']['projectTypeName'], '水利')
+
+
+class SchemeCalculationApiTests(TestCase):
+    def setUp(self):
+        self.admin = get_user_model().objects.create_superuser(
+            username='scheme-admin',
+            password='123456',
+        )
+        self.customer = Customer.objects.create(
+            name='三层道路客户',
+            grade='A',
+            province='河北省',
+            city='石家庄市',
+        )
+        self.project = Project.objects.create(
+            customer=self.customer,
+            name='园区道路项目',
+            business_owner=self.admin,
+        )
+        self.payload = {
+            'title': '园区道路三层方案造价分析',
+            'layerCount': 3,
+            'remarks': '需要先做试验段，运输费用另计。',
+            'layers': [
+                {
+                    'name': '土凝岩稳定土', 'structureLayer': '面层',
+                    'mixDescription': '土凝岩稳定土（PS-I）',
+                    'length': 100, 'width': 4, 'thickness': 0.2,
+                    'dosagePercent': 10, 'unitPrice': 600, 'density': 1.7,
+                },
+                {
+                    'name': '土凝岩稳定土', 'structureLayer': '基层',
+                    'mixDescription': '8%土凝岩稳定土（PS-I）',
+                    'length': 100, 'width': 4, 'thickness': 0.2,
+                    'dosagePercent': 8, 'unitPrice': 600, 'density': 1.7,
+                },
+                {
+                    'name': '土凝岩稳定土', 'structureLayer': '底基层',
+                    'mixDescription': '6%土凝岩稳定土（PS-I）',
+                    'length': 100, 'width': 4, 'thickness': 0.2,
+                    'dosagePercent': 6, 'unitPrice': 600, 'density': 1.7,
+                },
+            ],
+        }
+
+    def test_three_layer_calculation_is_saved_and_quantity_rounds_up(self):
+        self.client.force_login(self.admin)
+        response = self.client.put(
+            reverse('scheme-calculation', args=(self.customer.id,)),
+            data=json.dumps(self.payload),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        result = response.json()['calculation']
+        self.assertEqual(result['layerCount'], 3)
+        self.assertEqual(len(result['layers']), 3)
+        self.assertEqual(result['layers'][0]['quantity'], 14)
+        self.assertEqual(result['layers'][0]['totalPrice'], 8400)
+        self.assertEqual(result['layers'][0]['mixDescription'], '10%土凝岩稳定土（PS-I）')
+        self.assertEqual(result['remarks'], self.payload['remarks'])
+        self.assertTrue(SchemeCalculation.objects.filter(project=self.project).exists())
+
+    def test_square_meter_price_uses_each_layers_actual_thickness(self):
+        self.client.force_login(self.admin)
+        self.payload['layers'][0]['thickness'] = 0.35
+        response = self.client.put(
+            reverse('scheme-calculation', args=(self.customer.id,)),
+            data=json.dumps(self.payload),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        first_layer = response.json()['calculation']['layers'][0]
+        self.assertEqual(first_layer['squareMeterPrice'], 35.7)
+
+    def test_export_returns_downloadable_xlsx(self):
+        self.client.force_login(self.admin)
+        self.client.put(
+            reverse('scheme-calculation', args=(self.customer.id,)),
+            data=json.dumps(self.payload),
+            content_type='application/json',
+        )
+        response = self.client.post(
+            reverse('export-scheme-calculation', args=(self.customer.id,)),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response['Content-Type'],
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        self.assertIn('attachment;', response['Content-Disposition'])
+        self.assertIn('.xlsx', response['Content-Disposition'])
+        self.assertEqual(int(response['Content-Length']), len(response.content))
+        self.assertGreater(len(response.content), 0)
+        workbook = load_workbook(BytesIO(response.content))
+        sheet = workbook.active
+        self.assertEqual(sheet['J12'].value, '土凝岩单平米报价（元/㎡）')
+        self.assertEqual(sheet.max_column, 12)
+        self.assertEqual(sheet.cell(row=18, column=1).value, '报价备注 / TERMS & NOTES')
+        self.assertEqual(sheet.cell(row=19, column=1).value, 1)
+        self.assertEqual(sheet.cell(row=19, column=2).value, self.payload['remarks'])
+        self.assertEqual(sheet.cell(row=20, column=1).value, 2)
+        self.assertEqual(sheet.cell(row=21, column=1).value, 3)
+        self.assertIsNone(sheet.auto_filter.ref)
+        self.assertEqual(sheet['A8'].value, '推荐掺量')
+        self.assertEqual(sheet['J8'].value, '材料总价')
+        self.assertEqual(sheet['J9'].value, '¥20,400.00')
+        self.assertEqual(sheet['A9'].value, '10% + 8% + 6%')
+        self.assertEqual(sheet['D9'].value, '¥48.96 /㎡')
+        self.assertEqual(sheet['D13'].value, '10%土凝岩稳定土（PS-I）')
+        self.assertNotIn('说明：', ' '.join(
+            str(cell.value or '') for row in sheet.iter_rows() for cell in row
+        ))
+
+
+class VisitorRecordApiTests(TestCase):
+    def setUp(self):
+        self.business = get_user_model().objects.create_user(
+            username='visitor-business', password='123456',
+        )
+        EmployeeProfile.objects.create(
+            user=self.business,
+            role=EmployeeProfile.Role.BUSINESS,
+            business_level=4,
+        )
+        self.other = get_user_model().objects.create_user(
+            username='visitor-other', password='123456',
+        )
+        EmployeeProfile.objects.create(
+            user=self.other,
+            role=EmployeeProfile.Role.OTHER,
+        )
+        self.customer = Customer.objects.create(name='来访测试客户', grade='A')
+        self.customer.source = '抖音'
+        self.customer.save(update_fields=('source',))
+
+    def visitor_payload(self):
+        return {
+            'customerId': self.customer.id,
+            'visitDate': timezone.localdate().isoformat(),
+            'visitorCount': 3,
+            'visitorContacts': [
+                {'name': '张伟', 'role': '项目经理'},
+                {'name': '李敏', 'role': '项目总工'},
+            ],
+            'purpose': '参观样板工程',
+            'remarks': '客户自驾到访',
+            'hostIds': [self.business.id, self.other.id],
+        }
+
+    def test_create_list_update_and_delete_linked_visitor_record(self):
+        self.client.force_login(self.business)
+        created = self.client.post(
+            reverse('visitor-records'),
+            data=json.dumps(self.visitor_payload()),
+            content_type='application/json',
+        )
+        self.assertEqual(created.status_code, 201)
+        record_id = created.json()['record']['id']
+        self.assertEqual(created.json()['record']['customer']['id'], self.customer.id)
+        self.assertEqual(created.json()['record']['visitorCount'], 3)
+        self.assertEqual(created.json()['record']['visitorContacts'][1]['role'], '项目总工')
+        self.assertEqual(created.json()['record']['hostIds'], [self.business.id, self.other.id])
+        self.assertEqual(created.json()['record']['remarks'], '客户自驾到访')
+        self.assertEqual(created.json()['record']['customer']['source'], '抖音')
+
+        listed = self.client.get(reverse('visitor-records')).json()['records']
+        self.assertEqual(len(listed), 1)
+        self.assertTrue(listed[0]['canManage'])
+
+        payload = self.visitor_payload()
+        payload['purpose'] = '技术方案交流'
+        updated = self.client.patch(
+            reverse('visitor-record-detail', args=(record_id,)),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()['record']['purpose'], '技术方案交流')
+        self.assertEqual(self.client.delete(reverse('visitor-record-detail', args=(record_id,))).status_code, 200)
+        self.assertFalse(VisitorRecord.objects.filter(id=record_id).exists())
+
+    def test_import_creates_linked_records_with_multiple_people(self):
+        self.client.force_login(self.business)
+        response = self.client.post(
+            reverse('visitor-records-import'),
+            data=json.dumps({'records': [{
+                '序号': 1,
+                '考察时间': '2026年8月13日',
+                '关联的客资': self.customer.name,
+                '来访客户负责人': '张伟｜项目经理；李敏｜项目总工',
+                '会谈内容': '技术方案交流',
+                '备注': '客户自驾到访',
+                '客户来源（自媒体）': '抖音',
+                '接待人员': f'{self.business.username}、{self.other.username}',
+                '洽谈总结': '客户认可方案，准备报价',
+            }]}),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['createdCount'], 1)
+        record = VisitorRecord.objects.get()
+        self.assertEqual(record.customer, self.customer)
+        self.assertEqual(record.host, self.business)
+        self.assertEqual(record.visitor_contacts[1], {'name': '李敏', 'role': '项目总工'})
+        self.assertEqual(set(record.hosts.values_list('id', flat=True)), {self.business.id, self.other.id})
+        self.assertEqual(record.purpose, '技术方案交流')
+        self.assertEqual(record.remarks, '客户自驾到访\n客户认可方案，准备报价')
+        self.assertEqual(record.notes, '')
+
+    def test_import_is_atomic_when_a_customer_cannot_be_linked(self):
+        self.client.force_login(self.business)
+        base_row = {
+            '序号': 1,
+            '考察时间': '2026-08-13',
+            '关联的客资': self.customer.name,
+            '会谈内容': '方案交流',
+            '备注': '',
+            '客户来源（自媒体）': '抖音',
+            '接待人员': self.business.username,
+            '洽谈总结': '',
+        }
+        invalid_row = {**base_row, '序号': 2, '关联的客资': '不存在的客资'}
+        response = self.client.post(
+            reverse('visitor-records-import'),
+            data=json.dumps({'records': [base_row, invalid_row]}),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('第 3 行', response.json()['error'])
+        self.assertFalse(VisitorRecord.objects.exists())
+
+    def test_export_returns_multiple_people_and_exact_eight_columns(self):
+        record = VisitorRecord.objects.create(
+            customer=self.customer,
+            visit_date=date(2026, 8, 13),
+            visitor_count=2,
+            visitor_contacts=[
+                {'name': '张伟', 'role': '项目经理'},
+                {'name': '李敏', 'role': '项目总工'},
+            ],
+            purpose='技术方案交流',
+            remarks='客户自驾到访',
+            notes='客户认可方案，准备报价',
+            host=self.business,
+            created_by=self.business,
+        )
+        record.hosts.set([self.business, self.other])
+        self.client.force_login(self.business)
+        response = self.client.get(reverse('visitor-records-export'))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response['Content-Type'],
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        self.assertIn('attachment;', response['Content-Disposition'])
+        workbook = load_workbook(BytesIO(response.content))
+        sheet = workbook.active
+        self.assertEqual(
+            [sheet.cell(row=1, column=index).value for index in range(1, 9)],
+            ['序号', '考察时间', '关联的客资', '来访客户负责人', '会谈内容', '备注', '客户来源（自媒体）', '接待人员'],
+        )
+        self.assertEqual(sheet.max_column, 8)
+        self.assertEqual(sheet['A2'].value, 1)
+        self.assertEqual(sheet['B2'].value.date(), date(2026, 8, 13))
+        self.assertEqual(sheet['C2'].value, self.customer.name)
+        self.assertEqual(sheet['D2'].value, '张伟（项目经理）\n李敏（项目总工）')
+        self.assertEqual(sheet['E2'].value, '技术方案交流')
+        self.assertEqual(sheet['F2'].value, '客户自驾到访\n客户认可方案，准备报价')
+        self.assertEqual(sheet['G2'].value, '抖音')
+        self.assertEqual(sheet['H2'].value, f'{self.business.username}\n{self.other.username}')
+
+    def test_legacy_summary_is_visible_as_remarks_and_consolidated_on_update(self):
+        record = VisitorRecord.objects.create(
+            customer=self.customer,
+            visit_date=date(2026, 8, 13),
+            visitor_count=1,
+            purpose='旧记录',
+            remarks='原备注',
+            notes='旧洽谈总结',
+            host=self.business,
+            created_by=self.business,
+        )
+        self.client.force_login(self.business)
+
+        listed = self.client.get(reverse('visitor-records')).json()['records']
+        self.assertEqual(listed[0]['remarks'], '原备注\n旧洽谈总结')
+        self.assertNotIn('notes', listed[0])
+
+        payload = self.visitor_payload()
+        payload['remarks'] = listed[0]['remarks']
+        updated = self.client.patch(
+            reverse('visitor-record-detail', args=(record.id,)),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+        self.assertEqual(updated.status_code, 200)
+        record.refresh_from_db()
+        self.assertEqual(record.remarks, '原备注\n旧洽谈总结')
+        self.assertEqual(record.notes, '')
+
+    def test_filters_by_date_source_keyword_and_any_host(self):
+        record = VisitorRecord.objects.create(
+            customer=self.customer,
+            visit_date=date(2026, 8, 13),
+            visitor_count=2,
+            contact_name='张伟、李敏',
+            visitor_contacts=[{'name': '张伟', 'role': '项目经理'}, {'name': '李敏', 'role': '项目总工'}],
+            purpose='技术交流',
+            host=self.business,
+            created_by=self.business,
+        )
+        record.hosts.set([self.business, self.other])
+        self.client.force_login(self.business)
+        response = self.client.get(reverse('visitor-records'), {
+            'q': '项目总工',
+            'dateFrom': '2026-08-01',
+            'dateTo': '2026-08-31',
+            'source': '抖音',
+            'hostId': self.other.id,
+        })
+        self.assertEqual([item['id'] for item in response.json()['records']], [record.id])
+
+    def test_unrelated_non_business_user_cannot_change_record(self):
+        record = VisitorRecord.objects.create(
+            customer=self.customer,
+            visit_date=timezone.localdate(),
+            visitor_count=1,
+            purpose='来访',
+            host=self.business,
+            created_by=self.business,
+        )
+        self.client.force_login(self.other)
+        response = self.client.delete(reverse('visitor-record-detail', args=(record.id,)))
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(VisitorRecord.objects.filter(id=record.id).exists())
+
+    def test_business_level_is_returned_for_group_sorting(self):
+        self.client.force_login(self.business)
+        employees = self.client.get(reverse('available-employees')).json()
+        business = next(item for item in employees['business'] if item['id'] == self.business.id)
+        self.assertEqual(business['businessLevel'], 4)
 
 
 class AvailableEmployeesApiTests(TestCase):
@@ -42,6 +646,19 @@ class AvailableEmployeesApiTests(TestCase):
             {item['id'] for item in payload['technical']},
             {technical.id, both.id},
         )
+        self.assertEqual(
+            {item['id'] for item in payload['all']},
+            {business.id, technical.id, both.id},
+        )
+        business_payload = next(item for item in payload['all'] if item['id'] == business.id)
+        technical_payload = next(item for item in payload['all'] if item['id'] == technical.id)
+        both_payload = next(item for item in payload['all'] if item['id'] == both.id)
+        self.assertIsNotNone(business_payload['businessLevel'])
+        self.assertIsNone(business_payload['technicalLevel'])
+        self.assertIsNone(technical_payload['businessLevel'])
+        self.assertIsNotNone(technical_payload['technicalLevel'])
+        self.assertIsNotNone(both_payload['businessLevel'])
+        self.assertIsNotNone(both_payload['technicalLevel'])
 
     def test_active_superuser_is_available_for_both_roles(self):
         superuser = get_user_model().objects.create_superuser(
@@ -64,6 +681,26 @@ class AvailableEmployeesApiTests(TestCase):
 
 
 class LoginAndAdminFormTests(TestCase):
+    def test_employee_profile_admin_loads_role_based_level_visibility_script(self):
+        admin_user = get_user_model().objects.create_superuser(
+            username='profile-admin',
+            password='123456',
+        )
+        employee = get_user_model().objects.create_user(username='tech-profile')
+        profile = EmployeeProfile.objects.create(
+            user=employee,
+            role=EmployeeProfile.Role.TECHNICAL,
+            technical_level=3,
+        )
+        self.client.force_login(admin_user)
+
+        response = self.client.get(reverse('admin:customers_employeeprofile_change', args=(profile.id,)))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'name="business_level"')
+        self.assertContains(response, 'name="technical_level"')
+        self.assertContains(response, 'admin/employee-profile-levels.js')
+
     def test_system_management_link_is_only_visible_to_superusers(self):
         employee = get_user_model().objects.create_user(
             username='employee',
@@ -222,7 +859,7 @@ class CustomerPersistenceApiTests(TestCase):
             'district': '顺德区',
             'grade': 'A',
             'description': '数据库持久化测试',
-            'progress': '技术方案验证汇报通过',
+            'progress': '方案与报价',
             'plan': '修改后的施工方案',
             'ownerId': self.business.id,
             'techId': self.technical.id,
@@ -272,7 +909,7 @@ class CustomerPersistenceApiTests(TestCase):
             'district': '',
             'grade': 'B',
             'description': '只修改这段客户描述',
-            'progress': '技术方案验证汇报通过',
+            'progress': '方案与报价',
             'plan': '原方案',
             'ownerId': '',
             'techId': '',
@@ -288,6 +925,212 @@ class CustomerPersistenceApiTests(TestCase):
         self.assertEqual(legacy.district, '')
         self.assertEqual(legacy.business_owner_name, '原商务负责人')
         self.assertEqual(legacy.technical_owner_name, '原技术负责人')
+
+    def test_customer_import_appends_without_replacing_existing_records(self):
+        existing_id = self.customer.id
+        original_count = Customer.objects.count()
+        payload = {
+            'customers': [
+                {
+                    'name': '追加导入甲',
+                    'phone': '13800000001',
+                    'source': '抖音',
+                    'province': '河北省',
+                    'city': '石家庄市',
+                    'district': '长安区',
+                    'grade': 'A',
+                    'description': '第一条追加导入测试',
+                    'progress': '需求对接',
+                    'plan': '道路方案',
+                    'projectTypeId': '',
+                },
+                {
+                    'name': '追加导入乙',
+                    'phone': '13800000002',
+                    'source': '视频号',
+                    'province': '山东省',
+                    'city': '济南市',
+                    'district': '历下区',
+                    'grade': 'B',
+                    'description': '第二条追加导入测试',
+                    'progress': '需求对接',
+                    'plan': '回填方案',
+                    'projectTypeId': '',
+                },
+            ],
+        }
+
+        response = self.client.post(
+            reverse('customers-import'),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['createdCount'], 2)
+        self.assertEqual(Customer.objects.count(), original_count + 2)
+        self.assertTrue(Customer.objects.filter(id=existing_id, name='修改前名称').exists())
+        self.assertTrue(Customer.objects.filter(name='追加导入甲').exists())
+        self.assertTrue(Customer.objects.filter(name='追加导入乙').exists())
+
+    def test_customer_import_is_atomic_when_one_row_is_invalid(self):
+        original_ids = list(Customer.objects.values_list('id', flat=True))
+        payload = {
+            'customers': [
+                {
+                    'name': '本行原本有效',
+                    'source': '抖音',
+                    'province': '河北省',
+                    'city': '石家庄市',
+                    'grade': 'A',
+                    'progress': '需求对接',
+                    'projectTypeId': '',
+                },
+                {
+                    'name': '缺少城市的无效行',
+                    'source': '视频号',
+                    'province': '山东省',
+                    'city': '',
+                    'grade': 'B',
+                    'progress': '需求对接',
+                    'projectTypeId': '',
+                },
+            ],
+        }
+
+        response = self.client.post(
+            reverse('customers-import'),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('第3行', response.json()['error'])
+        self.assertEqual(list(Customer.objects.values_list('id', flat=True)), original_ids)
+
+    def test_technical_employee_cannot_delete_customer(self):
+        self.client.force_login(self.technical)
+        response = self.client.delete(
+            reverse('customer-detail', args=[self.customer.id]),
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Customer.objects.filter(id=self.customer.id).exists())
+
+    def test_customer_owner_changes_are_synced_to_every_project_task(self):
+        project = Project.objects.create(
+            customer=self.customer,
+            name='负责人同步测试项目',
+            progress='需求对接',
+        )
+        business_task = project.follow_up_tasks.get(
+            role=FollowUpTask.Role.BUSINESS,
+        )
+        technical_task = FollowUpTask.objects.create(
+            project=project,
+            title='技术临时任务',
+            target_progress='项目内临时任务',
+            role=FollowUpTask.Role.TECHNICAL,
+            is_manual=True,
+        )
+
+        payload = {
+            'name': self.customer.name,
+            'phone': self.customer.phone,
+            'source': self.customer.source,
+            'referrer': self.customer.referrer,
+            'province': self.customer.province,
+            'city': self.customer.city,
+            'district': self.customer.district,
+            'grade': self.customer.grade,
+            'description': self.customer.description,
+            'progress': '需求对接',
+            'plan': '负责人同步测试方案',
+            'ownerId': self.business.id,
+            'techId': self.technical.id,
+        }
+        response = self.client.patch(
+            reverse('customer-detail', args=[self.customer.id]),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        project.refresh_from_db()
+        business_task.refresh_from_db()
+        technical_task.refresh_from_db()
+        self.assertEqual(project.business_owner, self.business)
+        self.assertEqual(project.technical_owner, self.technical)
+        self.assertEqual(business_task.assignee, self.business)
+        self.assertEqual(technical_task.assignee, self.technical)
+
+    def test_follow_up_owner_uses_matching_legacy_department_name(self):
+        legacy = Customer.objects.create(
+            name='旧数据负责人展示测试',
+            business_owner_name='旧商务负责人',
+            technical_owner_name='旧技术负责人',
+        )
+        project = Project.objects.create(
+            customer=legacy,
+            name='旧数据项目',
+            progress='需求对接',
+        )
+        FollowUpTask.objects.create(
+            project=project,
+            title='技术临时任务',
+            target_progress='项目内临时任务',
+            role=FollowUpTask.Role.TECHNICAL,
+            is_manual=True,
+        )
+
+        response = self.client.get(
+            reverse('customer-detail', args=[legacy.id]),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        owners = {
+            task['role']: task['assignee']['name']
+            for task in response.json()['followUps']
+        }
+        self.assertEqual(owners[FollowUpTask.Role.BUSINESS], '旧商务负责人')
+        self.assertEqual(owners[FollowUpTask.Role.TECHNICAL], '旧技术负责人')
+
+    def test_business_employee_can_delete_customer_and_related_records(self):
+        project = Project.objects.create(
+            customer=self.customer,
+            name='删除测试项目',
+            progress='需求对接',
+        )
+        task = project.follow_up_tasks.get(
+            target_progress='技术验证',
+            role=FollowUpTask.Role.BUSINESS,
+        )
+        response = self.client.delete(
+            reverse('customer-detail', args=[self.customer.id]),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload['deleted'])
+        self.assertEqual(payload['projectCount'], 1)
+        self.assertEqual(payload['followUpCount'], 2)
+        self.assertFalse(Customer.objects.filter(id=self.customer.id).exists())
+        self.assertFalse(Project.objects.filter(id=project.id).exists())
+        self.assertFalse(FollowUpTask.objects.filter(id=task.id).exists())
+
+    def test_superuser_without_business_role_can_delete_customer(self):
+        admin = get_user_model().objects.create_superuser(
+            username='customer-delete-admin',
+            password='123456',
+            email='admin@example.com',
+        )
+        self.client.force_login(admin)
+
+        response = self.client.delete(
+            reverse('customer-detail', args=[self.customer.id]),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Customer.objects.filter(id=self.customer.id).exists())
 
 
 class FollowUpTaskApiTests(TestCase):
@@ -342,6 +1185,61 @@ class FollowUpTaskApiTests(TestCase):
         self.assertEqual(task.assignee, self.technical)
         self.assertEqual(task.status, FollowUpTask.Status.PENDING)
 
+    def test_project_progress_uses_the_seven_core_stages(self):
+        self.assertEqual(PROGRESS_STAGES, (
+            '需求对接',
+            '技术验证',
+            '客户深度沟通',
+            '方案与报价',
+            '合同签订',
+            '项目实施跟进',
+            '售后维护与需求挖掘',
+        ))
+        self.assertEqual(normalize_progress('B段施工完成'), '项目实施跟进')
+
+    def test_customer_history_hides_system_tasks_beyond_next_stage(self):
+        stale = FollowUpTask.objects.create(
+            project=self.project,
+            title='不应提前显示的回访任务',
+            target_progress='售后维护与需求挖掘',
+            role=FollowUpTask.Role.BUSINESS,
+            assignee=self.business,
+            status=FollowUpTask.Status.COMPLETED,
+            completed_at=timezone.now(),
+            result='旧演示记录',
+        )
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse('customer-detail', args=[self.customer.id]))
+
+        self.assertEqual(response.status_code, 200)
+        returned_ids = {task['id'] for task in response.json()['followUps']}
+        self.assertNotIn(stale.id, returned_ids)
+        self.assertTrue(returned_ids)
+
+    def test_legacy_ab_stage_task_is_displayed_as_unified_trial_stage(self):
+        legacy = FollowUpTask.objects.create(
+            project=self.project,
+            title='推进并完成 B 段施工',
+            target_progress='B段施工完成',
+            role=FollowUpTask.Role.TECHNICAL,
+            assignee=self.technical,
+            status=FollowUpTask.Status.COMPLETED,
+            completed_at=timezone.now(),
+            result='历史施工记录仍保留',
+        )
+        self.project.progress = '项目实施跟进'
+        self.project.save(update_fields=('progress', 'updated_at'))
+        self.customer.progress = '项目实施跟进'
+        self.customer.save(update_fields=('progress', 'updated_at'))
+        self.client.force_login(self.admin)
+
+        detail = self.client.get(reverse('customer-detail', args=[self.customer.id])).json()
+        record = next(task for task in detail['followUps'] if task['id'] == legacy.id)
+        self.assertEqual(record['targetProgress'], '项目实施跟进')
+        self.assertNotIn('A 段', record['title'])
+        self.assertNotIn('B 段', record['title'])
+
     def test_employee_only_sees_tasks_assigned_to_their_account(self):
         self.client.force_login(self.technical)
         response = self.client.get(reverse('follow-up-tasks'))
@@ -372,6 +1270,93 @@ class FollowUpTaskApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['tasks'], [])
+
+    def test_c_and_d_customers_do_not_generate_or_display_followup_tasks(self):
+        hidden_tasks = []
+        hidden_customers = []
+        for grade in ('C', 'D'):
+            customer = Customer.objects.create(
+                name=f'{grade}类客户',
+                grade=grade,
+                progress=PROGRESS_STAGES[4],
+                business_owner=self.business,
+                technical_owner=self.technical,
+            )
+            project = Project.objects.create(
+                customer=customer,
+                name=f'{grade}类项目',
+                progress=PROGRESS_STAGES[4],
+                business_owner=self.business,
+                technical_owner=self.technical,
+            )
+            self.assertFalse(project.follow_up_tasks.exists())
+            hidden_customers.append(customer)
+            hidden_tasks.append(FollowUpTask.objects.create(
+                project=project,
+                title='历史跟进记录',
+                target_progress=PROGRESS_STAGES[5],
+                role=FollowUpTask.Role.TECHNICAL,
+                assignee=self.business,
+            ))
+        self.client.force_login(self.admin)
+
+        response = self.client.get(reverse('follow-up-tasks'))
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        returned_ids = {task['id'] for task in payload['tasks']}
+        self.assertTrue(returned_ids.isdisjoint(task.id for task in hidden_tasks))
+        self.assertEqual(payload['summary']['total'], len(payload['tasks']))
+
+        for customer in hidden_customers:
+            detail = self.client.get(reverse('customer-detail', args=[customer.id]))
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(detail.json()['followUps'], [])
+
+    def test_c_and_d_customers_cannot_create_or_modify_followup_tasks(self):
+        self.client.force_login(self.admin)
+        for grade in ('C', 'D'):
+            customer = Customer.objects.create(
+                name=f'{grade}类受限客户',
+                grade=grade,
+                business_owner=self.business,
+                technical_owner=self.technical,
+            )
+            project = Project.objects.create(
+                customer=customer,
+                name=f'{grade}类受限项目',
+                business_owner=self.business,
+                technical_owner=self.technical,
+            )
+            create_response = self.client.post(
+                reverse('follow-up-tasks'),
+                data=json.dumps({
+                    'projectId': project.id,
+                    'title': '不应创建的跟进任务',
+                    'role': FollowUpTask.Role.BUSINESS,
+                }),
+                content_type='application/json',
+            )
+            self.assertEqual(create_response.status_code, 400)
+
+            historical_task = FollowUpTask.objects.create(
+                project=project,
+                title='保留但不可操作的历史记录',
+                target_progress=PROGRESS_STAGES[1],
+                role=FollowUpTask.Role.BUSINESS,
+                assignee=self.business,
+            )
+            detail_url = reverse('follow-up-task-detail', args=[historical_task.id])
+            self.assertEqual(
+                self.client.patch(
+                    detail_url,
+                    data=json.dumps({'title': '尝试修改'}),
+                    content_type='application/json',
+                ).status_code,
+                403,
+            )
+            self.assertEqual(self.client.delete(detail_url).status_code, 403)
+            self.assertTrue(FollowUpTask.objects.filter(id=historical_task.id).exists())
 
     def test_api_returns_only_one_current_status_card_per_project(self):
         current_task = self.project.follow_up_tasks.get(
@@ -415,6 +1400,12 @@ class FollowUpTaskApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 403)
 
+        response = self.client.delete(
+            reverse('follow-up-task-detail', args=[task.id]),
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(FollowUpTask.objects.filter(id=task.id).exists())
+
     def test_completion_requires_result_and_advances_project(self):
         task = self.project.follow_up_tasks.get(
             target_progress=PROGRESS_STAGES[5],
@@ -447,7 +1438,7 @@ class FollowUpTaskApiTests(TestCase):
         self.assertTrue(
             self.project.follow_up_tasks.filter(
                 target_progress=PROGRESS_STAGES[6],
-                assignee=self.technical,
+                assignee=self.business,
                 status=FollowUpTask.Status.PENDING,
             ).exists(),
         )
@@ -463,6 +1454,142 @@ class FollowUpTaskApiTests(TestCase):
         self.assertEqual(completed_record['result'], '已完成现场工作并上传记录')
         self.assertTrue(completed_record['completedLabel'])
         self.assertEqual(completed_record['fromProgress'], PROGRESS_STAGES[4])
+
+    def test_completed_result_can_be_edited_without_replaying_progress(self):
+        task = self.project.follow_up_tasks.get(
+            target_progress=PROGRESS_STAGES[5],
+        )
+        self.client.force_login(self.technical)
+        url = reverse('follow-up-task-detail', args=[task.id])
+        response = self.client.patch(
+            url,
+            data=json.dumps({
+                'status': FollowUpTask.Status.COMPLETED,
+                'result': '首次完成记录',
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        task.refresh_from_db()
+        original_completed_at = task.completed_at
+
+        response = self.client.patch(
+            url,
+            data=json.dumps({'result': '修正后的完整跟进结果'}),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+
+        task.refresh_from_db()
+        self.project.refresh_from_db()
+        self.assertEqual(task.result, '修正后的完整跟进结果')
+        self.assertEqual(task.completed_at, original_completed_at)
+        self.assertEqual(self.project.progress, PROGRESS_STAGES[5])
+
+    def test_project_owner_can_create_manual_task_without_advancing_stage(self):
+        self.client.force_login(self.business)
+        payload = {
+            'projectId': self.project.id,
+            'title': '临时补充一组材料试件',
+            'role': FollowUpTask.Role.BUSINESS,
+            'dueAt': (timezone.now() + timedelta(days=1)).isoformat(),
+        }
+        response = self.client.post(
+            reverse('follow-up-tasks'),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 201)
+        created = response.json()['task']
+        self.assertTrue(created['isManual'])
+        self.assertEqual(created['fromProgress'], self.project.progress)
+        self.assertEqual(created['targetProgress'], self.project.progress)
+
+        task = FollowUpTask.objects.get(id=created['id'])
+        response = self.client.patch(
+            reverse('follow-up-task-detail', args=[task.id]),
+            data=json.dumps({
+                'status': FollowUpTask.Status.COMPLETED,
+                'result': '临时任务已经处理完成',
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+
+        task.refresh_from_db()
+        self.project.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(task.status, FollowUpTask.Status.COMPLETED)
+        self.assertEqual(self.project.progress, PROGRESS_STAGES[4])
+        self.assertEqual(self.customer.progress, PROGRESS_STAGES[4])
+
+    def test_employee_cannot_create_manual_task_for_unassigned_project(self):
+        self.client.force_login(self.other)
+        response = self.client.post(
+            reverse('follow-up-tasks'),
+            data=json.dumps({
+                'projectId': self.project.id,
+                'title': '无权新增的项目任务',
+                'role': FollowUpTask.Role.BUSINESS,
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_project_owner_can_edit_task_fields_without_changing_progress(self):
+        task = self.project.follow_up_tasks.get(
+            target_progress=PROGRESS_STAGES[5],
+        )
+        due_at = timezone.now() + timedelta(days=2)
+        self.client.force_login(self.business)
+
+        response = self.client.patch(
+            reverse('follow-up-task-detail', args=[task.id]),
+            data=json.dumps({
+                'title': '调整后的阶段跟进任务',
+                'role': FollowUpTask.Role.BUSINESS,
+                'dueAt': due_at.isoformat(),
+            }),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        task.refresh_from_db()
+        self.project.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(task.title, '调整后的阶段跟进任务')
+        self.assertEqual(task.role, FollowUpTask.Role.BUSINESS)
+        self.assertEqual(task.assignee, self.business)
+        self.assertEqual(task.due_at, due_at)
+        self.assertEqual(self.project.progress, PROGRESS_STAGES[4])
+        self.assertEqual(self.customer.progress, PROGRESS_STAGES[4])
+        self.assertTrue(response.json()['task']['canDelete'])
+
+    def test_deleting_completed_record_does_not_roll_back_project(self):
+        task = self.project.follow_up_tasks.get(
+            target_progress=PROGRESS_STAGES[5],
+        )
+        self.client.force_login(self.technical)
+        detail_url = reverse('follow-up-task-detail', args=[task.id])
+        response = self.client.patch(
+            detail_url,
+            data=json.dumps({
+                'status': FollowUpTask.Status.COMPLETED,
+                'result': '阶段工作已经完成',
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+
+        self.client.force_login(self.admin)
+        response = self.client.delete(detail_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(FollowUpTask.objects.filter(id=task.id).exists())
+        self.project.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(self.project.progress, PROGRESS_STAGES[5])
+        self.assertEqual(self.customer.progress, PROGRESS_STAGES[5])
 
 
 class TomorrowItemApiTests(TestCase):
