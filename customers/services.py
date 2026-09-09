@@ -2,7 +2,7 @@ from datetime import timedelta
 
 from django.utils import timezone
 
-from .models import FollowUpTask, Project, ProjectType
+from .models import CustomerProjectAssociation, FollowUpTask, Project, ProjectType
 
 
 PROGRESS_STAGES = (
@@ -79,54 +79,22 @@ def follow_up_task_matches_project_progress(task):
 
 
 def sync_project_followup_tasks(project):
-    if project.customer.grade not in FOLLOW_UP_CUSTOMER_GRADES:
-        return
+    """Legacy entry point: stage changes no longer create or complete tasks.
 
-    current_index = progress_index(project.progress)
-    now = timezone.now()
-
-    for task in project.follow_up_tasks.exclude(status=FollowUpTask.Status.COMPLETED):
-        if progress_index(task.target_progress) <= current_index:
-            task.status = FollowUpTask.Status.COMPLETED
-            task.completed_at = now
-            if not task.result:
-                task.result = '项目进度更新后由系统自动完成'
-            task.save(update_fields=('status', 'completed_at', 'result', 'updated_at'))
-
-    if current_index >= len(PROGRESS_STAGES) - 1:
-        return
-
-    target_progress = PROGRESS_STAGES[current_index + 1]
-    title, roles = NEXT_TASKS[target_progress]
-    for role in roles:
-        assignee = (
-            project.business_owner
-            if role == FollowUpTask.Role.BUSINESS
-            else project.technical_owner
-        )
-        task, created = FollowUpTask.objects.get_or_create(
-            project=project,
-            target_progress=target_progress,
-            role=role,
-            defaults={
-                'title': title,
-                'assignee': assignee,
-                'due_at': now + timedelta(days=3),
-            },
-        )
-        if not created and task.status != FollowUpTask.Status.COMPLETED:
-            changed_fields = []
-            if task.title != title:
-                task.title = title
-                changed_fields.append('title')
-            if task.assignee_id != getattr(assignee, 'id', None):
-                task.assignee = assignee
-                changed_fields.append('assignee')
-            if changed_fields:
-                task.save(update_fields=(*changed_fields, 'updated_at'))
+    Historical records are retained. Deadlines and completion are explicit
+    user actions, independent of a project's formal stage.
+    """
+    return
 
 
-def sync_customer_primary_project(customer, project_type_id='preserve'):
+def sync_customer_primary_project(
+    customer,
+    project_type_id='preserve',
+    *,
+    project_name='preserve',
+    previous_business_owner_id='preserve',
+    previous_technical_owner_id='preserve',
+):
     project = customer.projects.order_by('created_at', 'id').first()
     if project is None:
         project = Project(customer=customer)
@@ -135,29 +103,51 @@ def sync_customer_primary_project(customer, project_type_id='preserve'):
             ProjectType.objects.filter(id=project_type_id).first()
             if project_type_id else None
         )
-    project.name = customer.plan or f'{customer.name}项目'
+    # 项目名称是独立、稳定的业务标识。显式传入时才更新；兼容没有项目的
+    # 历史客户时使用可追溯编号，不借用客户名称，也不覆盖已有项目名。
+    if project_name != 'preserve':
+        project.name = str(project_name).strip()[:150]
+    elif project.pk is None:
+        project.name = f'历史项目 #C{customer.id}'
     project.progress = customer.progress
     project.plan = customer.plan
     project.province = customer.province
+    project.country = customer.country
     project.city = customer.city
     project.district = customer.district
-    project.business_owner = customer.business_owner
-    project.technical_owner = customer.technical_owner
+    if project.pk is None or project.owners_inherit_customer:
+        project.business_owner = customer.business_owner
+        project.technical_owner = customer.technical_owner
     project.save()
-
-    # 客资页面维护的是客户级负责人，因此同一客户下的所有项目和任务
-    # 都应使用这两位负责人。任务包含已完成和临时任务，避免历史记录
-    # 继续显示“待分配”或旧负责人。
-    customer.projects.update(
-        business_owner=customer.business_owner,
-        technical_owner=customer.technical_owner,
+    CustomerProjectAssociation.objects.get_or_create(
+        customer=customer,
+        project=project,
     )
+
     FollowUpTask.objects.filter(
-        project__customer=customer,
-        role=FollowUpTask.Role.BUSINESS,
-    ).update(assignee=customer.business_owner)
+        project=project, role=FollowUpTask.Role.BUSINESS,
+    ).update(assignee=project.business_owner)
     FollowUpTask.objects.filter(
-        project__customer=customer,
-        role=FollowUpTask.Role.TECHNICAL,
-    ).update(assignee=customer.technical_owner)
+        project=project, role=FollowUpTask.Role.TECHNICAL,
+    ).update(assignee=project.technical_owner)
+
+    # 客户级负责人是新项目的默认值。已有项目若仍沿用客户原负责人则同步，
+    # 已经在项目层明确改派的负责人保持独立，避免多项目互相覆盖。
+    if previous_business_owner_id != 'preserve' or previous_technical_owner_id != 'preserve':
+        inherited_projects = customer.projects.exclude(id=project.id).filter(
+            owners_inherit_customer=True,
+        )
+        inherited_ids = list(inherited_projects.values_list('id', flat=True))
+        inherited_projects.update(
+            business_owner=customer.business_owner,
+            technical_owner=customer.technical_owner,
+        )
+        FollowUpTask.objects.filter(
+            project_id__in=inherited_ids,
+            role=FollowUpTask.Role.BUSINESS,
+        ).update(assignee=customer.business_owner)
+        FollowUpTask.objects.filter(
+            project_id__in=inherited_ids,
+            role=FollowUpTask.Role.TECHNICAL,
+        ).update(assignee=customer.technical_owner)
     return project

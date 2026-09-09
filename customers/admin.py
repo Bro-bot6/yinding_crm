@@ -7,10 +7,14 @@ from django.urls import reverse
 from django.utils.html import format_html
 
 from .models import (
+    AgencyAuthorization,
+    BusinessAttachment,
+    BusinessContract,
     Customer,
     EmployeeProfile,
     FollowUpTask,
     MaterialExperiment,
+    PartnershipIdentity,
     Project,
     ProjectProgressUpdate,
     ProjectType,
@@ -153,6 +157,7 @@ class CustomerAdmin(admin.ModelAdmin):
     list_display = (
         'name',
         'phone',
+        'wechat_status',
         'source',
         'grade',
         'province',
@@ -162,7 +167,7 @@ class CustomerAdmin(admin.ModelAdmin):
         'technical_owner_name',
         'updated_at',
     )
-    list_filter = ('grade', 'source', 'progress', 'province')
+    list_filter = ('grade', 'source', 'wechat_status', 'progress', 'province')
     search_fields = ('name', 'phone', 'description', 'plan')
     readonly_fields = ('created_at', 'updated_at')
 
@@ -183,6 +188,42 @@ class ProjectAdmin(admin.ModelAdmin):
     search_fields = ('name', 'customer__name', 'plan')
     autocomplete_fields = ('customer', 'business_owner', 'technical_owner')
     readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(PartnershipIdentity)
+class PartnershipIdentityAdmin(admin.ModelAdmin):
+    list_display = ('customer', 'identity_type', 'is_active', 'updated_at')
+    list_filter = ('identity_type', 'is_active')
+    search_fields = ('customer__name', 'notes')
+    autocomplete_fields = ('customer', 'created_by')
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(AgencyAuthorization)
+class AgencyAuthorizationAdmin(admin.ModelAdmin):
+    list_display = ('customer', 'level', 'region_label', 'is_exclusive', 'agreement_status', 'expiry_date')
+    list_filter = ('level', 'is_exclusive', 'agreement_status', 'expiry_date')
+    search_fields = ('customer__name', 'province', 'city', 'district', 'product_scope', 'agreement_number')
+    autocomplete_fields = ('customer', 'viewers', 'created_by')
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(BusinessContract)
+class BusinessContractAdmin(admin.ModelAdmin):
+    list_display = ('title', 'customer', 'project', 'status', 'amount', 'expiry_date')
+    list_filter = ('status', 'expiry_date')
+    search_fields = ('title', 'contract_number', 'customer__name', 'project__name')
+    autocomplete_fields = ('customer', 'project', 'created_by')
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(BusinessAttachment)
+class BusinessAttachmentAdmin(admin.ModelAdmin):
+    list_display = ('name', 'customer', 'project', 'category', 'is_sensitive', 'created_at')
+    list_filter = ('category', 'is_sensitive')
+    search_fields = ('name', 'customer__name', 'project__name')
+    autocomplete_fields = ('customer', 'project', 'uploaded_by')
+    readonly_fields = ('created_at',)
 
 
 @admin.register(ProjectType)

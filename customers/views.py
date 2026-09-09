@@ -1,14 +1,14 @@
 import json
 import math
 import re
-from datetime import date, timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Count, Max, Q
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -20,10 +20,15 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from .models import (
+    AgencyAuthorization,
+    BusinessAttachment,
+    BusinessContract,
     Customer,
+    CustomerProjectAssociation,
     EmployeeProfile,
     FollowUpTask,
     MaterialExperiment,
+    PartnershipIdentity,
     ProgressUpdateReadReceipt,
     ProgressUpdateReadState,
     Project,
@@ -39,6 +44,7 @@ from .services import (
     follow_up_task_matches_project_progress,
     normalize_progress,
     sync_customer_primary_project,
+    sync_project_followup_tasks,
 )
 
 
@@ -56,16 +62,16 @@ def health_check(request):
 def available_employees(request):
     users = (
         get_user_model()
-        .objects.filter(is_active=True)
+        .objects.filter(is_active=True, is_superuser=False)
         .select_related('employee_profile')
         .order_by('first_name', 'username')
     )
     result = {'all': [], 'business': [], 'technical': []}
     for user in users:
         profile = getattr(user, 'employee_profile', None)
-        if not user.is_superuser and profile is None:
+        if profile is None:
             continue
-        role = EmployeeProfile.Role.BOTH if user.is_superuser else profile.role
+        role = profile.role
         display_name = (
             profile.nickname if profile and profile.nickname
             else user.get_full_name() or user.username
@@ -91,6 +97,10 @@ def available_employees(request):
             result['business'].append(employee)
         if role in (EmployeeProfile.Role.TECHNICAL, EmployeeProfile.Role.BOTH):
             result['technical'].append(employee)
+    # A dual-role employee can rank differently in the two business lists.
+    # Python's stable sort retains the existing name order for equal levels.
+    result['business'].sort(key=lambda employee: -(employee['businessLevel'] or 0))
+    result['technical'].sort(key=lambda employee: -(employee['technicalLevel'] or 0))
     return JsonResponse(result)
 
 
@@ -122,7 +132,56 @@ def can_manage_project(user, project):
         user.is_superuser
         or project.business_owner_id == user.id
         or project.technical_owner_id == user.id
+        or (project.owners_inherit_customer and not project.business_owner_id and project.customer.business_owner_id == user.id)
+        or (project.owners_inherit_customer and not project.technical_owner_id and project.customer.technical_owner_id == user.id)
     )
+
+
+def is_internal_user(user):
+    if user.is_superuser:
+        return True
+    profile = getattr(user, 'employee_profile', None)
+    return bool(profile and profile.role != EmployeeProfile.Role.AGENT)
+
+
+def can_manage_commercial_records(user):
+    if user.is_superuser:
+        return True
+    profile = getattr(user, 'employee_profile', None)
+    return bool(profile and profile.role in (EmployeeProfile.Role.BUSINESS, EmployeeProfile.Role.BOTH))
+
+
+def authorization_region_query(authorization, prefix=''):
+    query = Q(**{f'{prefix}province': authorization.province})
+    if authorization.city:
+        query &= Q(**{f'{prefix}city': authorization.city})
+    if authorization.district:
+        query &= Q(**{f'{prefix}district': authorization.district})
+    return query
+
+
+def accessible_customers(user):
+    queryset = Customer.objects.all()
+    if is_internal_user(user):
+        return queryset
+    today = timezone.localdate()
+    authorizations = AgencyAuthorization.objects.filter(
+        viewers=user,
+        effective_date__lte=today,
+        expiry_date__gte=today,
+        agreement_status__in=(
+            AgencyAuthorization.AgreementStatus.ACTIVE,
+            AgencyAuthorization.AgreementStatus.RENEWED,
+        ),
+    )
+    scope = Q(business_owner=user) | Q(technical_owner=user)
+    for authorization in authorizations:
+        scope |= authorization_region_query(authorization)
+    return queryset.filter(scope).distinct()
+
+
+def can_view_customer(user, customer):
+    return accessible_customers(user).filter(id=customer.id).exists()
 
 
 def can_manage_follow_up(user, task):
@@ -165,22 +224,29 @@ def serialize_customer(customer):
         customer.technical_owner_name or '待分配',
     )
     primary_project = customer.projects.select_related('project_type').order_by('created_at', 'id').first()
+    identities = list(customer.partnership_identities.filter(is_active=True))
     return {
         'id': customer.id,
         'name': customer.name,
         'phone': customer.phone,
+        'wechatStatus': customer.wechat_status,
+        'updatedAt': customer.updated_at.isoformat(),
         'source': customer.source,
         'channel': customer.channel,
         'referrer': customer.referrer,
         'province': customer.province,
         'city': customer.city,
         'district': customer.district,
-        'region': ' · '.join(filter(None, (customer.province, customer.city))),
+        'country': customer.country,
+        'region': ' · '.join(filter(None, (customer.country or customer.province, customer.city))),
         'grade': customer.grade,
+        'cooperationStatus': customer.cooperation_status,
+        'cooperationStatusLabel': customer.get_cooperation_status_display(),
         'description': customer.description,
         'progress': customer.progress,
         'percent': stage_percent(customer.progress),
         'plan': customer.plan,
+        'projectName': primary_project.name if primary_project else '',
         'projectTypeId': primary_project.project_type_id if primary_project else '',
         'projectTypeName': primary_project.project_type.name if primary_project and primary_project.project_type else '未分类',
         'ownerId': customer.business_owner_id or '',
@@ -192,6 +258,15 @@ def serialize_customer(customer):
         'created': created_at.strftime('%Y年%m月%d日'),
         'updated': customer.updated_at.strftime('%m月%d日 %H:%M'),
         'color': customer.color or '#5b7cfa',
+        'identities': [
+            {
+                'id': identity.id,
+                'type': identity.identity_type,
+                'label': identity.get_identity_type_display(),
+                'notes': identity.notes,
+            }
+            for identity in identities
+        ],
     }
 
 
@@ -210,26 +285,24 @@ def get_available_owner(user_id, allowed_roles):
         return None
     user = (
         get_user_model()
-        .objects.filter(id=user_id, is_active=True)
+        .objects.filter(id=user_id, is_active=True, is_superuser=False)
         .select_related('employee_profile')
         .first()
     )
     if not user:
         return None
-    if user.is_superuser:
-        return user
     profile = getattr(user, 'employee_profile', None)
     if not profile or profile.role not in allowed_roles:
         return None
     return user
 
 
-def update_customer_from_payload(customer, payload):
-    required = {
-        'name': '客户名称',
-        'province': '省份',
-        'city': '城市',
-    }
+def update_customer_from_payload(customer, payload, *, require_location=True):
+    required = {'name': '客户名称', 'phone': '联系方式'}
+    country = str(payload.get('country', customer.country) or '').strip()
+    overseas = payload.get('locationMode') == 'overseas' or bool(country)
+    if require_location:
+        required.update({'country' if overseas else 'province': '国家 / 地区' if overseas else '省份', 'city': '城市'})
     missing = [
         label for field, label in required.items()
         if not str(payload.get(field, '')).strip()
@@ -237,13 +310,31 @@ def update_customer_from_payload(customer, payload):
     if missing:
         return f"请填写：{'、'.join(missing)}"
 
+    phone = str(payload.get('phone', '')).strip()
+    wechat_status = payload.get('wechatStatus', customer.wechat_status)
+    if wechat_status not in ('yes', 'no', 'rejected'):
+        return '请选择有效的是否添加微信状态'
+    customer.wechat_status = wechat_status
+    if len(phone) > 100:
+        return '联系方式最多100个字符'
+    if len(country) > 100:
+        return '国家 / 地区最多100个字符'
+    if any(len(str(payload.get(field) or '').strip()) > 50 for field in ('province', 'city', 'district')):
+        return '省市及详细地区最多50个字符'
+
     source = str(payload.get('source', '抖音')).strip()
+    preserves_legacy_source = bool(customer.pk and source == customer.source)
+    if source not in Customer.Source.values and not preserves_legacy_source:
+        return f"客资来源必须是：{'、'.join(Customer.Source.values)}"
     referrer = str(payload.get('referrer', '')).strip() if source == '朋友介绍' else ''
     if source == '朋友介绍' and not referrer:
         return '朋友介绍的客资必须填写介绍人'
 
-    owner_id = payload.get('ownerId')
-    technician_id = payload.get('techId')
+    grade = str(payload.get('grade', customer.grade or 'C')).strip().upper()
+    grade = grade if grade in ('A', 'B', 'C', 'D') else 'C'
+    uses_full_project_modules = grade in FOLLOW_UP_CUSTOMER_GRADES
+    owner_id = payload.get('ownerId') if uses_full_project_modules else None
+    technician_id = payload.get('techId') if uses_full_project_modules else None
     owner = None
     technician = None
     if owner_id:
@@ -262,27 +353,47 @@ def update_customer_from_payload(customer, payload):
             return '所选技术负责人账号不可用'
 
     customer.name = str(payload.get('name', '')).strip()
-    customer.phone = str(payload.get('phone', '')).strip()
+    customer.phone = phone
     customer.source = source
     customer.referrer = referrer
     customer.channel = f'介绍人：{referrer}' if referrer else '手动修改'
-    customer.province = str(payload.get('province', '')).strip()
+    customer.country = country
+    customer.province = '' if country else str(payload.get('province', '')).strip()
     customer.city = str(payload.get('city', '')).strip()
     customer.district = str(payload.get('district', '')).strip()
-    grade = str(payload.get('grade', 'D')).strip().upper()
-    customer.grade = grade if grade in ('A', 'B', 'C', 'D') else 'D'
+    customer.grade = grade
+    cooperation_status = str(payload.get(
+        'cooperationStatus',
+        customer.cooperation_status or Customer.CooperationStatus.NONE,
+    )).strip()
+    if cooperation_status not in dict(Customer.CooperationStatus.choices):
+        return '请选择有效的合作关系状态'
+    customer.cooperation_status = cooperation_status
     customer.description = str(payload.get('description', '')).strip()
-    progress = str(payload.get('progress', '需求对接')).strip()
-    if progress not in PROGRESS_STAGES:
-        return '请选择有效的项目进度'
-    customer.progress = progress
-    customer.plan = str(payload.get('plan', '')).strip() or '方案待完善'
-    if owner:
-        customer.business_owner = owner
-        customer.business_owner_name = employee_display_name(owner)
-    if technician:
-        customer.technical_owner = technician
-        customer.technical_owner_name = employee_display_name(technician)
+    if uses_full_project_modules:
+        progress = str(payload.get('progress', '需求对接')).strip()
+        if progress not in PROGRESS_STAGES:
+            return '请选择有效的项目进度'
+        customer.progress = progress
+        customer.plan = str(payload.get('plan', '')).strip()
+        if require_location and not customer.plan:
+            customer.plan = '方案待完善'
+        if 'ownerId' in payload:
+            customer.business_owner_name = employee_display_name(owner) if owner else ('' if customer.business_owner_id else customer.business_owner_name)
+            customer.business_owner = owner
+        if 'techId' in payload:
+            customer.technical_owner_name = employee_display_name(technician) if technician else ('' if customer.technical_owner_id else customer.technical_owner_name)
+            customer.technical_owner = technician
+    else:
+        # C / D 级只登记基础信息和项目地区，忽略旧页面传入的隐藏字段。
+        # 编辑时保留已经存在的项目历史数据，不因等级变化而清空它们。
+        if customer.pk is None:
+            customer.business_owner = None
+            customer.technical_owner = None
+            customer.business_owner_name = ''
+            customer.technical_owner_name = ''
+            customer.progress = PROGRESS_STAGES[0]
+            customer.plan = ''
     return ''
 
 
@@ -298,43 +409,71 @@ def project_type_from_payload(payload, *, required_key=False):
     return project_type.id, ''
 
 
+def project_name_from_payload(payload, *, required=False):
+    if 'projectName' not in payload:
+        return (None, '请填写项目名称') if required else ('preserve', '')
+    project_name = str(payload.get('projectName') or '').strip()
+    if not project_name:
+        return None, '请填写项目名称'
+    return project_name[:150], ''
+
+
 @login_required
 @require_http_methods(['GET', 'POST'])
 def customers_collection(request):
     if request.method == 'GET':
-        customers = Customer.objects.select_related(
+        customers = accessible_customers(request.user).select_related(
             'business_owner__employee_profile',
             'technical_owner__employee_profile',
-        ).prefetch_related('projects__project_type')
+        ).prefetch_related('projects__project_type', 'partnership_identities')
         projects = Project.objects.select_related(
             'customer',
             'project_type',
             'business_owner__employee_profile',
             'technical_owner__employee_profile',
-        )
+        ).filter(customer__in=customers)
         return JsonResponse({
             'customers': [serialize_customer(item) for item in customers],
             'projects': [serialize_project(item) for item in projects],
+            'mapAccess': 'internal' if is_internal_user(request.user) else 'authorized_agent',
         })
 
+    if not can_manage_commercial_records(request.user):
+        return JsonResponse({'error': '只有商务人员或超级管理员可以新增客资'}, status=403)
     payload, error_response = parse_payload(request)
     if error_response:
         return error_response
     customer = Customer(sort_order=Customer.objects.count())
+    previous_business_owner_id = customer.business_owner_id
+    previous_technical_owner_id = customer.technical_owner_id
     validation_error = update_customer_from_payload(customer, payload)
     if validation_error:
         return JsonResponse({'error': validation_error}, status=400)
-    project_type_id, validation_error = project_type_from_payload(payload, required_key=True)
+    project_type_id, validation_error = (
+        project_type_from_payload(payload, required_key=True)
+        if customer.grade in FOLLOW_UP_CUSTOMER_GRADES else (None, '')
+    )
+    if validation_error:
+        return JsonResponse({'error': validation_error}, status=400)
+    project_name, validation_error = project_name_from_payload(payload, required=True)
     if validation_error:
         return JsonResponse({'error': validation_error}, status=400)
     customer.save()
-    sync_customer_primary_project(customer, project_type_id)
+    sync_customer_primary_project(
+        customer,
+        project_type_id,
+        project_name=project_name,
+        previous_business_owner_id=previous_business_owner_id,
+        previous_technical_owner_id=previous_technical_owner_id,
+    )
     return JsonResponse({'customer': serialize_customer(customer)}, status=201)
 
 
 @login_required
 @require_http_methods(['POST'])
 def customers_import(request):
+    if not can_manage_commercial_records(request.user):
+        return JsonResponse({'error': '只有商务人员或超级管理员可以导入客资'}, status=403)
     payload, error_response = parse_payload(request)
     if error_response:
         return error_response
@@ -344,26 +483,61 @@ def customers_import(request):
     if len(items) > 500:
         return JsonResponse({'error': '单次最多导入500条客资'}, status=400)
 
+    batch_lead_mode = payload.get('mode') == 'leads'
     created_customers = []
     try:
         with transaction.atomic():
             start_order = Customer.objects.count()
             for index, item in enumerate(items):
-                row_number = index + 2
+                row_number = index + (1 if batch_lead_mode else 2)
                 if not isinstance(item, dict):
                     raise ValueError(f'第{row_number}行数据格式不正确')
+                if batch_lead_mode:
+                    name = str(item.get('name') or '').strip()
+                    phone = str(item.get('phone') or '').strip()
+                    source = str(item.get('source') or '').strip() or Customer.Source.DOUYIN
+                    description = str(item.get('description') or '').strip()
+                    if not name:
+                        raise ValueError(f'第{row_number}行：请填写客户名称')
+                    if not phone or len(phone) > 100:
+                        raise ValueError(f'第{row_number}行：请填写联系方式（最多100个字符）')
+                    if len(name) > 100:
+                        raise ValueError(f'第{row_number}行：客户名称最多100个字符')
+                    if len(source) > 30:
+                        raise ValueError(f'第{row_number}行：客资来源最多30个字符')
+                    if source not in Customer.Source.values:
+                        raise ValueError(f"第{row_number}行：客资来源必须是：{'、'.join(Customer.Source.values)}")
+                    customer = Customer(
+                        sort_order=start_order + index,
+                        name=name,
+                        phone=phone,
+                        source=source,
+                        channel='批量新增',
+                        description=description,
+                    )
+                    customer.save()
+                    created_customers.append(customer)
+                    continue
                 customer = Customer(sort_order=start_order + index)
                 validation_error = update_customer_from_payload(customer, item)
                 if validation_error:
                     raise ValueError(f'第{row_number}行：{validation_error}')
-                project_type_id, validation_error = project_type_from_payload(
-                    item,
-                    required_key=True,
+                grade = str(item.get('grade', 'C')).strip().upper()
+                project_type_id, validation_error = (
+                    project_type_from_payload(item, required_key=True)
+                    if grade in FOLLOW_UP_CUSTOMER_GRADES else (None, '')
                 )
                 if validation_error:
                     raise ValueError(f'第{row_number}行：{validation_error}')
+                project_name, validation_error = project_name_from_payload(item, required=True)
+                if validation_error:
+                    raise ValueError(f'第{row_number}行：{validation_error}')
                 customer.save()
-                sync_customer_primary_project(customer, project_type_id)
+                sync_customer_primary_project(
+                    customer,
+                    project_type_id,
+                    project_name=project_name,
+                )
                 created_customers.append(customer)
     except ValueError as error:
         return JsonResponse({'error': str(error)}, status=400)
@@ -376,6 +550,7 @@ def customers_import(request):
 
 @login_required
 @require_http_methods(['GET', 'PATCH', 'DELETE'])
+@transaction.atomic
 def customer_detail(request, customer_id):
     customer = get_object_or_404(
         Customer.objects.select_related(
@@ -384,6 +559,8 @@ def customer_detail(request, customer_id):
         ),
         id=customer_id,
     )
+    if not can_view_customer(request.user, customer):
+        return JsonResponse({'error': '无权查看该客户或其所在授权区域'}, status=403)
     if request.method == 'DELETE':
         if not can_delete_customer(request.user):
             return JsonResponse({'error': '只有商务部人员或超级管理员可以删除客资'}, status=403)
@@ -401,10 +578,15 @@ def customer_detail(request, customer_id):
     if request.method == 'GET':
         follow_ups = FollowUpTask.objects.none()
         progress_update_items = ProjectProgressUpdate.objects.none()
-        project = primary_customer_project(customer)
-        if customer.grade in FOLLOW_UP_CUSTOMER_GRADES:
+        requested_project_id = request.GET.get('projectId')
+        project = customer.projects.select_related(
+            'customer', 'project_type',
+            'business_owner__employee_profile',
+            'technical_owner__employee_profile',
+        ).filter(id=requested_project_id).first() if str(requested_project_id or '').isdigit() else primary_customer_project(customer)
+        if customer.grade in FOLLOW_UP_CUSTOMER_GRADES and project:
             follow_up_items = FollowUpTask.objects.filter(
-                project__customer_id=customer.id,
+                project=project,
             ).select_related(
                 'assignee__employee_profile',
                 'project__customer',
@@ -415,8 +597,9 @@ def customer_detail(request, customer_id):
                 task for task in follow_up_items
                 if follow_up_task_matches_project_progress(task)
             ]
+        if project:
             progress_update_items = ProjectProgressUpdate.objects.filter(
-                project__customer_id=customer.id,
+                project=project,
                 project__is_active=True,
             ).select_related(
                 'created_by__employee_profile',
@@ -439,6 +622,16 @@ def customer_detail(request, customer_id):
             ).filter(project=project).first()
         return JsonResponse({
             'customer': serialize_customer(customer),
+            'projects': [serialize_project(item) for item in customer.projects.select_related(
+                'customer', 'project_type',
+                'business_owner__employee_profile', 'technical_owner__employee_profile',
+            ).order_by('created_at', 'id')],
+            'associatedProjects': [serialize_project_association(item) for item in customer.project_associations.select_related(
+                'project__customer', 'project__project_type',
+                'project__business_owner__employee_profile',
+                'project__technical_owner__employee_profile',
+            ).filter(project__customer__in=accessible_customers(request.user))],
+            'selectedProjectId': project.id if project else None,
             'followUps': [serialize_follow_up_task(task, request.user) for task in follow_ups],
             'progressUpdates': [serialize_progress_update(item, request.user) for item in progress_update_items],
             'visitorRecords': [serialize_visitor_record(item, request.user) for item in visitor_items],
@@ -451,24 +644,120 @@ def customer_detail(request, customer_id):
                 if project else None
             ),
             'canManageProject': bool(project and can_manage_project(request.user, project)),
+            'partnerships': [serialize_partnership_identity(item) for item in customer.partnership_identities.all()],
+            'authorizations': [serialize_agency_authorization(item) for item in (
+                customer.agency_authorizations.all()
+                if is_internal_user(request.user)
+                else customer.agency_authorizations.filter(viewers=request.user)
+            )],
+            'contracts': [serialize_business_contract(item, request.user) for item in customer.business_contracts.select_related('project').all()],
+            'attachments': [serialize_business_attachment(item, request.user) for item in customer.business_attachments.select_related('project').all() if not item.is_sensitive or can_manage_commercial_records(request.user)],
+            'canManageCommercial': can_manage_commercial_records(request.user),
         })
 
+    if not (
+        can_manage_commercial_records(request.user)
+        or customer.projects.filter(
+            Q(business_owner=request.user) | Q(technical_owner=request.user)
+        ).exists()
+    ):
+        return JsonResponse({'error': '只有商务人员、项目负责人或超级管理员可以修改客户资料'}, status=403)
     payload, error_response = parse_payload(request)
     if error_response:
         return error_response
-    validation_error = update_customer_from_payload(customer, payload)
+    had_project = customer.projects.exists()
+    primary = primary_customer_project(customer)
+    selected_project = primary
+    if payload.get('projectId') not in (None, ''):
+        selected_project = customer.projects.filter(pk=payload['projectId']).first() if str(payload['projectId']).isdigit() else None
+        if selected_project is None:
+            return JsonResponse({'error': '未找到当前客户对应的项目，请刷新后重试'}, status=400)
+    editing_secondary = bool(primary and selected_project.id != primary.id)
+    if selected_project and not (can_manage_project(request.user, selected_project) or can_manage_commercial_records(request.user)):
+        return JsonResponse({'error': '无权修改当前项目'}, status=403)
+    project_fields = ('country', 'province', 'city', 'district', 'progress', 'plan',
+                      'business_owner', 'technical_owner', 'business_owner_name', 'technical_owner_name')
+    original_project_values = {field: getattr(customer, field) for field in project_fields}
+    allow_incomplete = bool(payload.get('allowIncomplete')) and not had_project
+    previous_business_owner_id = customer.business_owner_id
+    previous_technical_owner_id = customer.technical_owner_id
+    validation_error = update_customer_from_payload(
+        customer,
+        payload,
+        require_location=not allow_incomplete,
+    )
     if validation_error:
         return JsonResponse({'error': validation_error}, status=400)
-    project_type_id, validation_error = project_type_from_payload(payload)
+    project_type_id, validation_error = (
+        project_type_from_payload(payload)
+        if customer.grade in FOLLOW_UP_CUSTOMER_GRADES
+        else ('preserve' if had_project else None, '')
+    )
     if validation_error:
         return JsonResponse({'error': validation_error}, status=400)
-    customer.save()
-    sync_customer_primary_project(customer, project_type_id)
+    raw_project_name = str(payload.get('projectName') or '').strip()
+    has_project_details = customer.grade in FOLLOW_UP_CUSTOMER_GRADES and (
+        payload.get('projectTypeId') not in ('', None, 'preserve')
+        or str(payload.get('plan') or '').strip()
+        or payload.get('progress', PROGRESS_STAGES[0]) != PROGRESS_STAGES[0]
+    )
+    if not had_project and has_project_details and not raw_project_name and (
+        'projectName' in payload or payload.get('projectTypeId') not in ('', None, 'preserve')
+    ):
+        return JsonResponse({'error': '已填写项目类型或进展信息，请先填写项目名称和项目地区再保存'}, status=400)
+    if had_project and 'projectName' in payload and not raw_project_name:
+        return JsonResponse({'error': '请填写项目名称'}, status=400)
+    if raw_project_name and (not (customer.country or customer.province) or not customer.city):
+        return JsonResponse({'error': '建立项目时请填写国家 / 地区或省份，以及城市'}, status=400)
+    project = None
+    if editing_secondary:
+        project = selected_project
+        for field in ('country', 'province', 'city', 'district'):
+            setattr(project, field, getattr(customer, field))
+        if raw_project_name:
+            project.name = raw_project_name[:150]
+        if customer.grade in FOLLOW_UP_CUSTOMER_GRADES:
+            project.progress = customer.progress
+            project.plan = customer.plan
+            if project_type_id != 'preserve':
+                project.project_type_id = project_type_id
+            for key, field in (('ownerId', 'business_owner'), ('techId', 'technical_owner')):
+                if key in payload:
+                    setattr(project, field, getattr(customer, field))
+                    project.owners_inherit_customer = False
+        for field, value in original_project_values.items():
+            setattr(customer, field, value)
+        customer.save()
+        project.save()
+        for role, assignee in ((FollowUpTask.Role.BUSINESS, project.business_owner), (FollowUpTask.Role.TECHNICAL, project.technical_owner)):
+            FollowUpTask.objects.filter(project=project, role=role).update(assignee=assignee)
+        if project.is_active:
+            sync_project_followup_tasks(project)
+    else:
+        customer.save()
+    if not editing_secondary and (had_project or raw_project_name or not allow_incomplete):
+        # Explicit edits target this project even if its assignees were previously
+        # detached from customer defaults. Do not silently retain old assignees.
+        if primary and payload.get('projectId') not in (None, '') and customer.grade in FOLLOW_UP_CUSTOMER_GRADES:
+            for key, field in (('ownerId', 'business_owner'), ('techId', 'technical_owner')):
+                if key in payload:
+                    setattr(primary, field, getattr(customer, field))
+            primary.save(update_fields=['business_owner', 'technical_owner'])
+        project = sync_customer_primary_project(
+            customer,
+            project_type_id,
+            project_name=raw_project_name if raw_project_name else 'preserve',
+            previous_business_owner_id=previous_business_owner_id,
+            previous_technical_owner_id=previous_technical_owner_id,
+        )
     customer = Customer.objects.select_related(
         'business_owner__employee_profile',
         'technical_owner__employee_profile',
     ).get(id=customer.id)
-    return JsonResponse({'customer': serialize_customer(customer)})
+    return JsonResponse({
+        'customer': serialize_customer(customer),
+        'project': serialize_project(project) if project else None,
+    })
 
 
 def primary_customer_project(customer):
@@ -478,6 +767,17 @@ def primary_customer_project(customer):
         'business_owner__employee_profile',
         'technical_owner__employee_profile',
     ).order_by('created_at', 'id').first()
+
+
+def requested_customer_project(request, customer):
+    project_id = request.GET.get('projectId')
+    if str(project_id or '').isdigit():
+        return customer.projects.select_related(
+            'customer', 'project_type',
+            'business_owner__employee_profile',
+            'technical_owner__employee_profile',
+        ).filter(id=project_id).first()
+    return primary_customer_project(customer)
 
 
 def decimal_value(value, label, *, minimum=Decimal('0.0001'), allow_zero=False):
@@ -552,40 +852,49 @@ def normalize_scheme_payload(payload):
     }
 
 
-def calculate_scheme_layer(layer):
-    dosage_ratio = Decimal(str(layer['dosagePercent'])) / Decimal('100')
-    exact_quantity = (
+def scheme_exact_quantity(layer):
+    return (
         Decimal(str(layer['length']))
         * Decimal(str(layer['width']))
         * Decimal(str(layer['thickness']))
-        * dosage_ratio
+        * Decimal(str(layer['dosagePercent'])) / Decimal('100')
         * Decimal(str(layer['density']))
     )
-    rounded_quantity = math.ceil(exact_quantity)
+
+
+def scheme_quantity_totals(layers):
+    exact = sum((scheme_exact_quantity(layer) for layer in layers), Decimal('0'))
+    return {'totalExactQuantity': float(exact), 'totalQuantity': math.ceil(exact)}
+
+
+def calculate_scheme_layer(layer):
+    dosage_ratio = Decimal(str(layer['dosagePercent'])) / Decimal('100')
+    exact_quantity = scheme_exact_quantity(layer)
     square_price = (
         Decimal(str(layer['thickness']))
         * dosage_ratio
         * Decimal(str(layer['density']))
         * Decimal(str(layer['unitPrice']))
     )
-    total_price = Decimal(rounded_quantity) * Decimal(str(layer['unitPrice']))
+    total_price = exact_quantity * Decimal(str(layer['unitPrice']))
     return {
         **layer,
-        'exactQuantity': round(float(exact_quantity), 3),
-        'quantity': rounded_quantity,
-        'squareMeterPrice': round(float(square_price), 2),
-        'totalPrice': round(float(total_price), 2),
+        'exactQuantity': float(exact_quantity),
+        'quantity': float(exact_quantity),
+        'squareMeterPrice': float(square_price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)),
+        'totalPrice': float(total_price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)),
     }
 
 
 def serialize_scheme_calculation(calculation, user):
-    layers = [calculate_scheme_layer(layer) for layer in calculation.layers]
+    layers = [calculate_scheme_layer(layer) for layer in calculation.layers[:calculation.layer_count]]
     return {
         'id': calculation.id,
         'projectId': calculation.project_id,
         'title': calculation.title,
         'layerCount': calculation.layer_count,
         'layers': layers,
+        **scheme_quantity_totals(layers),
         'remarks': calculation.remarks,
         'totalPrice': round(sum(layer['totalPrice'] for layer in layers), 2),
         'createdBy': employee_display_name(calculation.created_by, '系统'),
@@ -642,6 +951,8 @@ def default_scheme_payload(project):
         }],
         'remarks': '实际掺配比例需根据土质情况结合试验确定。\n此次报价不含运输费用。\n土凝岩材料报价包含13%税点。',
         'totalPrice': 0,
+        'totalExactQuantity': 0,
+        'totalQuantity': 0,
         'createdBy': '',
         'updatedBy': '',
         'createdLabel': '',
@@ -654,7 +965,7 @@ def default_scheme_payload(project):
 @require_http_methods(['GET', 'PUT'])
 def scheme_calculation(request, customer_id):
     customer = get_object_or_404(Customer, id=customer_id)
-    project = primary_customer_project(customer)
+    project = requested_customer_project(request, customer)
     if not project:
         return JsonResponse({'error': '该客户尚未建立项目，无法进行方案测算'}, status=400)
 
@@ -708,7 +1019,7 @@ def scheme_calculation(request, customer_id):
 @require_http_methods(['GET', 'PUT'])
 def material_experiment(request, customer_id):
     customer = get_object_or_404(Customer, id=customer_id)
-    project = primary_customer_project(customer)
+    project = requested_customer_project(request, customer)
     if not project:
         return JsonResponse({'error': '该客户尚未建立项目，无法登记实验数据'}, status=400)
     experiment = MaterialExperiment.objects.select_related(
@@ -771,7 +1082,7 @@ def build_scheme_workbook(calculation):
     sheet.page_margins.top = 0.35
     sheet.page_margins.bottom = 0.35
 
-    headers = ['序号', '名称', '结构层', '配比说明', '长度m', '宽度m', '厚度m', '掺量', '单价（元/吨）', '土凝岩单平米报价（元/㎡）', '土凝岩用量（吨）', '材料总价（元）']
+    headers = ['序号', '名称', '结构层', '配比说明', '长度m', '宽度m', '厚度m', '掺量', '单价（元/吨）', '土凝岩单平米报价（元/㎡）', '理论用量（吨）', '材料总价（元）']
     widths = [7, 20, 11, 26, 11, 11, 11, 11, 15, 22, 17, 19]
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
@@ -805,7 +1116,7 @@ def build_scheme_workbook(calculation):
 
     project = calculation.project
     customer = project.customer
-    region = ' / '.join(filter(None, (project.province or customer.province, project.city or customer.city, project.district or customer.district))) or '待补充'
+    region = ' / '.join(filter(None, (project.country or project.province or customer.country or customer.province, project.city or customer.city, project.district or customer.district))) or '待补充'
     customer_phone = customer.phone or '待补充'
     business_owner = employee_display_name(project.business_owner)
     prepared_date = timezone.localdate().strftime('%Y年%m月%d日')
@@ -832,12 +1143,12 @@ def build_scheme_workbook(calculation):
     dosage_text = ' + '.join(f"{layer['dosagePercent']:g}%" for layer in layers) or '—'
     total_square_price = sum(layer['squareMeterPrice'] for layer in layers)
     square_price_text = f'¥{total_square_price:,.2f} /㎡' if layers else '—'
-    total_quantity = sum(layer['quantity'] for layer in layers)
+    total_quantity = scheme_quantity_totals(layers)['totalQuantity']
     total_price = sum(layer['totalPrice'] for layer in layers)
     summary_cards = [
         (1, 3, '推荐掺量', dosage_text, pale_gold, gold, dark_green),
         (4, 6, '各层单平米报价合计', square_price_text, pale_gold, gold, dark_green),
-        (7, 9, '土凝岩总用量', f'{total_quantity:,.0f} 吨', mint, brand_green, dark_green),
+        (7, 9, '项目总用量（合计后向上取整）', f'{total_quantity:,.0f} 吨', mint, brand_green, dark_green),
         (10, 12, '材料总价', f'¥{total_price:,.2f}', dark_green, gold, 'FF5A5F'),
     ]
     for start_column, end_column, label, value, fill_color, accent_color, value_color in summary_cards:
@@ -908,7 +1219,7 @@ def build_scheme_workbook(calculation):
         sheet.cell(row=row, column=8).number_format = '0.00%'
         for column in (5, 6, 7, 9, 10, 12):
             sheet.cell(row=row, column=column).number_format = '#,##0.00'
-        sheet.cell(row=row, column=11).number_format = '0'
+        sheet.cell(row=row, column=11).number_format = '0.000'
         sheet.cell(row=row, column=12).number_format = '¥#,##0.00'
         sheet.row_dimensions[row].height = 44
 
@@ -917,7 +1228,7 @@ def build_scheme_workbook(calculation):
     sheet.cell(row=total_row, column=1, value='报价合计')
     sheet.cell(row=total_row, column=8, value=dosage_text)
     sheet.merge_cells(start_row=total_row, start_column=9, end_row=total_row, end_column=10)
-    sheet.cell(row=total_row, column=9, value='土凝岩用量')
+    sheet.cell(row=total_row, column=9, value='项目取整用量')
     sheet.cell(row=total_row, column=11, value=total_quantity)
     sheet.cell(row=total_row, column=12, value=total_price)
     for column in range(1, 13):
@@ -942,7 +1253,7 @@ def build_scheme_workbook(calculation):
 
     note_row = note_title_row + 1
     remark_lines = [line.strip() for line in (calculation.remarks or '').splitlines() if line.strip()]
-    display_remarks = remark_lines or ['无']
+    display_remarks = remark_lines + ['各层用量不取整；项目理论总量合计后向上取整作为采购参考。材料金额按各层理论用量及对应单价计算，未含取整差额费用。']
     while len(display_remarks) < 3:
         display_remarks.append('')
     for offset, remark in enumerate(display_remarks):
@@ -976,7 +1287,7 @@ def build_scheme_workbook(calculation):
 @require_http_methods(['POST'])
 def export_scheme_calculation(request, customer_id):
     customer = get_object_or_404(Customer, id=customer_id)
-    project = primary_customer_project(customer)
+    project = requested_customer_project(request, customer)
     if not project:
         return JsonResponse({'error': '该客户尚未建立项目'}, status=400)
     if not can_manage_project(request.user, project):
@@ -1008,12 +1319,17 @@ def serialize_project(project):
         'name': project.name,
         'progress': project.progress,
         'plan': project.plan,
+        'commercialNotes': project.commercial_notes,
+        'quotedAmount': float(project.quoted_amount) if project.quoted_amount is not None else None,
+        'contractAmount': float(project.contract_amount) if project.contract_amount is not None else None,
+        'ownersInheritCustomer': project.owners_inherit_customer,
         'projectType': {
             'id': project.project_type_id or '',
             'name': project.project_type.name if project.project_type else '未分类',
         },
         'isActive': project.is_active,
-        'region': ' · '.join(filter(None, (project.province, project.city, project.district))),
+        'country': project.country,
+        'region': ' · '.join(filter(None, (project.country or project.province, project.city, project.district))),
         'province': project.province,
         'city': project.city,
         'district': project.district,
@@ -1271,14 +1587,13 @@ def follow_up_tasks(request):
     if can_view_all:
         users = (
             get_user_model()
-            .objects.filter(is_active=True)
+            .objects.filter(is_active=True, is_superuser=False)
             .filter(
                 Q(employee_profile__role__in=(
                     EmployeeProfile.Role.BUSINESS,
                     EmployeeProfile.Role.TECHNICAL,
                     EmployeeProfile.Role.BOTH,
                 ))
-                | Q(is_superuser=True)
             )
             .select_related('employee_profile')
             .distinct()
@@ -1373,15 +1688,8 @@ def follow_up_task_detail(request, task_id):
         )
     task.save()
 
-    if transitioned_to_completed and not task.is_manual:
-        project = task.project
-        project.progress = task.target_progress
-        project.save()
-        customer = project.customer
-        primary_project_id = customer.projects.order_by('created_at', 'id').values_list('id', flat=True).first()
-        if primary_project_id == project.id:
-            customer.progress = project.progress
-            customer.save(update_fields=('progress', 'updated_at'))
+    # Completing a task records its result only. Formal stages are edited
+    # explicitly in project details, never inferred from task completion.
 
     refreshed = FollowUpTask.objects.select_related(
         'assignee__employee_profile',
@@ -1549,6 +1857,194 @@ def visible_progress_updates(user):
     return queryset.distinct()
 
 
+def overview_period():
+    """Return the inclusive 30-day reporting window in the configured timezone."""
+    end_date = timezone.localdate()
+    start_date = end_date - timedelta(days=29)
+    current_timezone = timezone.get_current_timezone()
+    start_at = timezone.make_aware(datetime.combine(start_date, time.min), current_timezone)
+    end_at = timezone.make_aware(datetime.combine(end_date, time.max), current_timezone)
+    return start_date, end_date, start_at, end_at
+
+
+def overview_five_day_buckets(start_date, end_date):
+    buckets = []
+    bucket_start = start_date
+    while bucket_start <= end_date:
+        bucket_end = min(bucket_start + timedelta(days=4), end_date)
+        buckets.append((bucket_start, bucket_end))
+        bucket_start = bucket_end + timedelta(days=1)
+    return buckets
+
+
+@login_required
+@require_GET
+def overview_statistics(request):
+    """Aggregate the overview exclusively from persisted, permission-scoped records."""
+    start_date, end_date, start_at, end_at = overview_period()
+    buckets = overview_five_day_buckets(start_date, end_date)
+    customers = accessible_customers(request.user).filter(grade__in=('A', 'B', 'C'))
+
+    grade_counts = {
+        grade: customers.filter(grade=grade).count()
+        for grade in ('A', 'B', 'C')
+    }
+    recent_customer_rows = list(
+        customers.filter(created_at__range=(start_at, end_at))
+        .values('created_at', 'source')
+        .order_by('created_at', 'id')
+    )
+    customer_sources = list(Customer.Source.values)
+    customer_bucket_rows = []
+    for bucket_start, bucket_end in buckets:
+        counts = {source: 0 for source in customer_sources}
+        for row in recent_customer_rows:
+            created_date = timezone.localtime(row['created_at']).date()
+            if bucket_start <= created_date <= bucket_end:
+                source = str(row['source'] or '').strip() or '未填写来源'
+                if source in counts:
+                    counts[source] += 1
+        customer_bucket_rows.append({
+            'startDate': bucket_start.isoformat(),
+            'endDate': bucket_end.isoformat(),
+            'counts': counts,
+            'total': sum(counts.values()),
+        })
+    source_counts = [
+        {
+            'name': source,
+            'count': sum(bucket['counts'].get(source, 0) for bucket in customer_bucket_rows),
+        }
+        for source in customer_sources
+    ]
+
+    region_rows = list(
+        customers.filter(country='').exclude(province='')
+        .values('province')
+        .annotate(count=Count('id'))
+        .order_by('-count', 'province')
+    )
+    missing_region_count = customers.filter(country='', province='').count()
+
+    projects = Project.objects.filter(customer__in=customers).select_related('project_type')
+    project_type_counts = list(
+        projects.values('project_type_id', 'project_type__name')
+        .annotate(count=Count('id'))
+        .order_by('-count', 'project_type__name')
+    )
+    project_type_counts = [
+        {
+            'id': row['project_type_id'] or '',
+            'name': row['project_type__name'] or '未分类',
+            'count': row['count'],
+        }
+        for row in project_type_counts
+    ]
+    project_stage_counts = [
+        {'name': row['progress'] or '未填写阶段', 'count': row['count']}
+        for row in projects.values('progress').annotate(count=Count('id')).order_by('-count', 'progress')
+    ]
+
+    visitor_rows = list(
+        VisitorRecord.objects.filter(
+            customer__in=customers,
+            visit_date__range=(start_date, end_date),
+        ).values('visit_date', 'visitor_count').order_by('visit_date', 'id')
+    )
+    visitor_bucket_rows = []
+    for bucket_start, bucket_end in buckets:
+        records = [
+            row for row in visitor_rows
+            if bucket_start <= row['visit_date'] <= bucket_end
+        ]
+        visitor_bucket_rows.append({
+            'startDate': bucket_start.isoformat(),
+            'endDate': bucket_end.isoformat(),
+            'visits': len(records),
+            'people': sum(int(row['visitor_count'] or 0) for row in records),
+        })
+
+    task_queryset = FollowUpTask.objects.filter(
+        project__customer__in=customers,
+        project__customer__grade__in=FOLLOW_UP_CUSTOMER_GRADES,
+    ).select_related('project__customer')
+    if not request.user.is_superuser:
+        task_queryset = task_queryset.filter(assignee=request.user)
+    now = timezone.now()
+    task_list = collapse_tasks_by_project([
+        task for task in task_queryset
+        if follow_up_task_matches_project_progress(task)
+    ], now)
+    tomorrow = end_date + timedelta(days=1)
+    open_tasks = [task for task in task_list if task.status != FollowUpTask.Status.COMPLETED]
+    today_due = sum(
+        1 for task in open_tasks
+        if task.due_at and timezone.localtime(task.due_at).date() == end_date
+    )
+    tomorrow_due = sum(
+        1 for task in open_tasks
+        if task.due_at and timezone.localtime(task.due_at).date() == tomorrow
+    )
+    overdue = sum(
+        1 for task in open_tasks
+        if task.due_at and task.due_at < now
+    )
+    recent_progress_count = visible_progress_updates(request.user).filter(
+        occurred_at__gte=now - timedelta(days=7),
+        occurred_at__lte=now,
+    ).count()
+
+    return JsonResponse({
+        'period': {
+            'startDate': start_date.isoformat(),
+            'endDate': end_date.isoformat(),
+            'timezone': str(timezone.get_current_timezone()),
+            'days': 30,
+        },
+        'customers': {
+            'total': customers.count(),
+            'gradeCounts': grade_counts,
+            'sourceCounts': source_counts,
+            'trendBuckets': customer_bucket_rows,
+            'regions': [
+                {'name': row['province'], 'count': row['count']}
+                for row in region_rows
+            ],
+            'missingRegionCount': missing_region_count,
+            'overseasCount': customers.exclude(country='').count(),
+        },
+        'projects': {
+            'total': projects.count(),
+            'active': projects.filter(is_active=True).count(),
+            'completed': projects.filter(is_active=False).count(),
+            'implementation': projects.filter(
+                is_active=True,
+                progress='项目实施跟进',
+            ).count(),
+            'typeCounts': project_type_counts,
+            'stageCounts': project_stage_counts,
+        },
+        'visitors': {
+            'visits': len(visitor_rows),
+            'people': sum(int(row['visitor_count'] or 0) for row in visitor_rows),
+            'trendBuckets': visitor_bucket_rows,
+        },
+        'followUps': {
+            'total': len(task_list),
+            'todayDue': today_due,
+            'tomorrowDue': tomorrow_due,
+            'overdue': overdue,
+            'completed': sum(
+                1 for task in task_list
+                if task.status == FollowUpTask.Status.COMPLETED
+            ),
+        },
+        'progressUpdates': {
+            'last7Days': recent_progress_count,
+        },
+    })
+
+
 def default_progress_interval(project):
     current_progress = normalize_progress(project.progress)
     try:
@@ -1710,8 +2206,6 @@ def progress_updates(request):
             id=payload.get('projectId'),
             is_active=True,
         )
-        if project.customer.grade not in FOLLOW_UP_CUSTOMER_GRADES:
-            return JsonResponse({'error': '只有 A、B 类客户可以新增进度更新'}, status=400)
         if not can_manage_project(request.user, project):
             return JsonResponse({'error': '只有该项目负责人或超级管理员可以更新进度'}, status=403)
         content = str(payload.get('content', '')).strip()
@@ -2302,3 +2796,824 @@ def visitor_record_detail(request, record_id):
     item.hosts.set(hosts)
     item = visitor_record_queryset().get(id=item.id)
     return JsonResponse({'record': serialize_visitor_record(item, request.user)})
+
+
+def expiry_metadata(expiry_date):
+    if not expiry_date:
+        return {'daysRemaining': None, 'expiryTone': 'none', 'reminderLabel': ''}
+    days_remaining = (expiry_date - timezone.localdate()).days
+    if days_remaining < 0:
+        tone = 'expired'
+        reminder = f'已到期 {abs(days_remaining)} 天'
+    elif days_remaining <= 30:
+        tone = 'urgent'
+        reminder = f'{days_remaining} 天后到期（30天提醒）'
+    elif days_remaining <= 60:
+        tone = 'warning'
+        reminder = f'{days_remaining} 天后到期（60天提醒）'
+    elif days_remaining <= 90:
+        tone = 'notice'
+        reminder = f'{days_remaining} 天后到期（90天提醒）'
+    else:
+        tone = 'normal'
+        reminder = ''
+    return {'daysRemaining': days_remaining, 'expiryTone': tone, 'reminderLabel': reminder}
+
+
+def serialize_partnership_identity(item):
+    return {
+        'id': item.id,
+        'type': item.identity_type,
+        'label': item.get_identity_type_display(),
+        'isActive': item.is_active,
+        'notes': item.notes,
+    }
+
+
+def serialize_project_association(item):
+    return {
+        'associationId': item.id,
+        'isOwned': item.customer_id == item.project.customer_id,
+        'project': serialize_project(item.project),
+    }
+
+
+def serialize_agency_authorization(item):
+    expiry = expiry_metadata(item.expiry_date)
+    if expiry['daysRemaining'] is not None and expiry['daysRemaining'] < 0:
+        coverage_status = 'expired'
+    elif item.agreement_status not in (
+        AgencyAuthorization.AgreementStatus.ACTIVE,
+        AgencyAuthorization.AgreementStatus.RENEWED,
+    ):
+        coverage_status = 'inactive'
+    elif expiry['daysRemaining'] is not None and expiry['daysRemaining'] <= 90:
+        coverage_status = 'expiring'
+    elif item.is_exclusive:
+        coverage_status = 'active'
+    else:
+        coverage_status = 'partial'
+    return {
+        'id': item.id,
+        'customerId': item.customer_id,
+        'customerName': item.customer.name if hasattr(item, 'customer') else '',
+        'level': item.level,
+        'levelLabel': item.get_level_display(),
+        'province': item.province,
+        'city': item.city,
+        'district': item.district,
+        'regionLabel': item.region_label,
+        'isExclusive': item.is_exclusive,
+        'exclusiveLabel': '独家' if item.is_exclusive else '非独家',
+        'productScope': item.product_scope,
+        'effectiveDate': item.effective_date.isoformat(),
+        'expiryDate': item.expiry_date.isoformat(),
+        'agreementStatus': item.agreement_status,
+        'agreementStatusLabel': item.get_agreement_status_display(),
+        'agreementNumber': item.agreement_number,
+        'coverageStatus': coverage_status,
+        **expiry,
+    }
+
+
+def serialize_business_contract(item, user=None):
+    expiry = expiry_metadata(item.expiry_date)
+    display_status = item.status
+    display_status_label = item.get_status_display()
+    if expiry['daysRemaining'] is not None and expiry['daysRemaining'] < 0 and item.status not in (
+        BusinessContract.Status.RENEWED, BusinessContract.Status.TERMINATED,
+    ):
+        display_status = BusinessContract.Status.EXPIRED
+        display_status_label = BusinessContract.Status.EXPIRED.label
+    elif (
+        item.status == BusinessContract.Status.ACTIVE
+        and expiry['daysRemaining'] is not None
+        and 0 <= expiry['daysRemaining'] <= 90
+    ):
+        display_status = BusinessContract.Status.EXPIRING
+        display_status_label = BusinessContract.Status.EXPIRING.label
+    return {
+        'id': item.id,
+        'title': item.title,
+        'contractNumber': item.contract_number if user is None or can_manage_commercial_records(user) else '',
+        'status': item.status,
+        'statusLabel': item.get_status_display(),
+        'displayStatus': display_status,
+        'displayStatusLabel': display_status_label,
+        'amount': (
+            float(item.amount)
+            if item.amount is not None and (user is None or can_manage_commercial_records(user))
+            else None
+        ),
+        'signedDate': item.signed_date.isoformat() if item.signed_date else '',
+        'effectiveDate': item.effective_date.isoformat() if item.effective_date else '',
+        'expiryDate': item.expiry_date.isoformat() if item.expiry_date else '',
+        'notes': item.notes,
+        'projectId': item.project_id or '',
+        'projectName': item.project.name if item.project else '',
+        **expiry,
+    }
+
+
+def serialize_business_attachment(item, user):
+    return {
+        'id': item.id,
+        'name': item.name,
+        'category': item.category,
+        'categoryLabel': item.get_category_display(),
+        'fileUrl': item.file_url,
+        'isSensitive': item.is_sensitive,
+        'projectId': item.project_id or '',
+        'projectName': item.project.name if item.project else '',
+        'createdLabel': timezone.localtime(item.created_at).strftime('%Y年%m月%d日 %H:%M'),
+    }
+
+
+def customer_for_business_request(user, customer_id, *, manage=False):
+    customer = get_object_or_404(Customer, id=customer_id)
+    if not can_view_customer(user, customer):
+        return customer, JsonResponse({'error': '无权查看该客户'}, status=403)
+    if manage and not can_manage_commercial_records(user):
+        return customer, JsonResponse({'error': '只有商务人员或超级管理员可以维护合作与合同资料'}, status=403)
+    return customer, None
+
+
+@login_required
+@require_http_methods(['GET', 'POST'])
+def customer_projects(request, customer_id):
+    customer, error = customer_for_business_request(request.user, customer_id)
+    if error:
+        return error
+    if request.method == 'GET':
+        items = customer.projects.select_related(
+            'customer', 'project_type',
+            'business_owner__employee_profile', 'technical_owner__employee_profile',
+        ).order_by('created_at', 'id')
+        return JsonResponse({'projects': [serialize_project(item) for item in items]})
+    if not can_manage_commercial_records(request.user):
+        return JsonResponse({'error': '只有商务人员或超级管理员可以新增项目'}, status=403)
+    payload, error_response = parse_payload(request)
+    if error_response:
+        return error_response
+    name = str(payload.get('name') or '').strip()
+    if not name:
+        return JsonResponse({'error': '请填写项目名称'}, status=400)
+    progress = normalize_progress(str(payload.get('progress') or PROGRESS_STAGES[0]).strip())
+    if progress not in PROGRESS_STAGES:
+        return JsonResponse({'error': '请选择有效的项目阶段'}, status=400)
+    project_type_id, validation_error = project_type_from_payload(payload)
+    if validation_error:
+        return JsonResponse({'error': validation_error}, status=400)
+    business_owner = customer.business_owner
+    technical_owner = customer.technical_owner
+    if payload.get('ownerId') not in ('', None):
+        business_owner = get_available_owner(
+            payload.get('ownerId'),
+            (EmployeeProfile.Role.BUSINESS, EmployeeProfile.Role.BOTH),
+        )
+        if not business_owner:
+            return JsonResponse({'error': '所选项目商务负责人不可用'}, status=400)
+    if payload.get('techId') not in ('', None):
+        technical_owner = get_available_owner(
+            payload.get('techId'),
+            (EmployeeProfile.Role.TECHNICAL, EmployeeProfile.Role.BOTH),
+        )
+        if not technical_owner:
+            return JsonResponse({'error': '所选项目技术负责人不可用'}, status=400)
+    quoted_amount, validation_error = project_amount(payload.get('quotedAmount'), '报价金额')
+    if validation_error:
+        return JsonResponse({'error': validation_error}, status=400)
+    contract_amount, validation_error = project_amount(payload.get('contractAmount'), '合同金额')
+    if validation_error:
+        return JsonResponse({'error': validation_error}, status=400)
+    project = Project.objects.create(
+        customer=customer,
+        project_type_id=None if project_type_id == 'preserve' else project_type_id,
+        name=name[:150],
+        progress=progress,
+        plan=str(payload.get('plan') or '').strip(),
+        commercial_notes=str(payload.get('commercialNotes') or '').strip(),
+        quoted_amount=quoted_amount,
+        contract_amount=contract_amount,
+        country=str(payload.get('country', customer.country) or '').strip(),
+        province=str(payload.get('province') or customer.province).strip(),
+        city=str(payload.get('city') or customer.city).strip(),
+        district=str(payload.get('district') or customer.district).strip(),
+        business_owner=business_owner,
+        technical_owner=technical_owner,
+        owners_inherit_customer=not ('ownerId' in payload or 'techId' in payload),
+    )
+    CustomerProjectAssociation.objects.get_or_create(
+        customer=customer,
+        project=project,
+        defaults={'created_by': request.user},
+    )
+    sync_project_followup_tasks(project)
+    project = Project.objects.select_related(
+        'customer', 'project_type', 'business_owner__employee_profile',
+        'technical_owner__employee_profile',
+    ).get(id=project.id)
+    return JsonResponse({'project': serialize_project(project)}, status=201)
+
+
+@login_required
+@require_http_methods(['GET', 'POST'])
+def customer_project_associations(request, customer_id):
+    customer, error = customer_for_business_request(
+        request.user, customer_id, manage=request.method == 'POST',
+    )
+    if error:
+        return error
+    visible_customers = accessible_customers(request.user)
+    if request.method == 'GET':
+        items = customer.project_associations.select_related(
+            'project__customer', 'project__project_type',
+            'project__business_owner__employee_profile',
+            'project__technical_owner__employee_profile',
+        ).filter(project__customer__in=visible_customers)
+        return JsonResponse({'associatedProjects': [serialize_project_association(item) for item in items]})
+
+    payload, error_response = parse_payload(request)
+    if error_response:
+        return error_response
+    project_id = payload.get('projectId')
+    if not str(project_id or '').isdigit():
+        return JsonResponse({'error': '请选择客资系统中的具体项目'}, status=400)
+    project = Project.objects.select_related(
+        'customer', 'project_type',
+        'business_owner__employee_profile', 'technical_owner__employee_profile',
+    ).filter(id=project_id, customer__in=visible_customers).first()
+    if not project:
+        return JsonResponse({'error': '未找到可访问的项目案例'}, status=404)
+    item, created = CustomerProjectAssociation.objects.get_or_create(
+        customer=customer,
+        project=project,
+        defaults={'created_by': request.user},
+    )
+    if customer.cooperation_status != Customer.CooperationStatus.COOPERATING:
+        customer.cooperation_status = Customer.CooperationStatus.COOPERATING
+        customer.save(update_fields=('cooperation_status', 'updated_at'))
+    return JsonResponse(
+        {'association': serialize_project_association(item)},
+        status=201 if created else 200,
+    )
+
+
+@login_required
+@require_http_methods(['DELETE'])
+def customer_project_association_detail(request, association_id):
+    item = get_object_or_404(
+        CustomerProjectAssociation.objects.select_related('customer', 'project'),
+        id=association_id,
+    )
+    if not can_view_customer(request.user, item.customer):
+        return JsonResponse({'error': '无权查看该项目关联'}, status=403)
+    if not can_manage_commercial_records(request.user):
+        return JsonResponse({'error': '只有商务人员或超级管理员可以维护项目关联'}, status=403)
+    project_id = item.project_id
+    item.delete()
+    return JsonResponse({'unlinked': True, 'projectId': project_id})
+
+
+def project_amount(value, label):
+    if value in ('', None):
+        return None, ''
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None, f'{label}必须是有效数字'
+    if amount < 0:
+        return None, f'{label}不能小于0'
+    return amount, ''
+
+
+@login_required
+@require_http_methods(['PATCH', 'DELETE'])
+def project_detail(request, project_id):
+    project = get_object_or_404(
+        Project.objects.select_related('customer', 'project_type'), id=project_id,
+    )
+    if not can_view_customer(request.user, project.customer):
+        return JsonResponse({'error': '无权查看该项目'}, status=403)
+    if not (can_manage_project(request.user, project) or can_manage_commercial_records(request.user)):
+        return JsonResponse({'error': '只有项目负责人、商务人员或超级管理员可以修改项目'}, status=403)
+    if request.method == 'DELETE':
+        project.is_active = False
+        project.save(update_fields=('is_active', 'updated_at'))
+        return JsonResponse({'archived': True, 'projectId': project.id})
+    payload, error_response = parse_payload(request)
+    if error_response:
+        return error_response
+    if 'name' in payload:
+        name = str(payload.get('name') or '').strip()
+        if not name:
+            return JsonResponse({'error': '项目名称不能为空'}, status=400)
+        project.name = name[:150]
+    if 'progress' in payload:
+        progress = normalize_progress(str(payload.get('progress') or '').strip())
+        if progress not in PROGRESS_STAGES:
+            return JsonResponse({'error': '请选择有效的项目阶段'}, status=400)
+        project.progress = progress
+    if 'isActive' in payload:
+        if not isinstance(payload.get('isActive'), bool):
+            return JsonResponse({'error': '项目完成状态格式不正确'}, status=400)
+        project.is_active = payload['isActive']
+    for field, payload_key in (
+        ('plan', 'plan'), ('commercial_notes', 'commercialNotes'),
+        ('country', 'country'), ('province', 'province'), ('city', 'city'), ('district', 'district'),
+    ):
+        if payload_key in payload:
+            setattr(project, field, str(payload.get(payload_key) or '').strip())
+    for field, payload_key, label in (
+        ('quoted_amount', 'quotedAmount', '报价金额'),
+        ('contract_amount', 'contractAmount', '合同金额'),
+    ):
+        if payload_key in payload:
+            amount, validation_error = project_amount(payload.get(payload_key), label)
+            if validation_error:
+                return JsonResponse({'error': validation_error}, status=400)
+            setattr(project, field, amount)
+    if 'projectTypeId' in payload:
+        project_type_id, validation_error = project_type_from_payload(payload)
+        if validation_error:
+            return JsonResponse({'error': validation_error}, status=400)
+        project.project_type_id = None if project_type_id == 'preserve' else project_type_id
+    if 'ownerId' in payload:
+        project.business_owner = get_available_owner(
+            payload.get('ownerId'),
+            (EmployeeProfile.Role.BUSINESS, EmployeeProfile.Role.BOTH),
+        ) if payload.get('ownerId') else None
+        if payload.get('ownerId') and not project.business_owner:
+            return JsonResponse({'error': '所选项目商务负责人不可用'}, status=400)
+    if 'techId' in payload:
+        project.technical_owner = get_available_owner(
+            payload.get('techId'),
+            (EmployeeProfile.Role.TECHNICAL, EmployeeProfile.Role.BOTH),
+        ) if payload.get('techId') else None
+        if payload.get('techId') and not project.technical_owner:
+            return JsonResponse({'error': '所选项目技术负责人不可用'}, status=400)
+    if 'ownerId' in payload or 'techId' in payload:
+        project.owners_inherit_customer = False
+    if project.country:
+        project.province = ''
+    if any(len(getattr(project, field)) > limit for field, limit in (('country', 100), ('province', 50), ('city', 50), ('district', 50))):
+        return JsonResponse({'error': '国家 / 地区最多100个字符，省市及详细地区最多50个字符'}, status=400)
+    project.save()
+    FollowUpTask.objects.filter(
+        project=project, role=FollowUpTask.Role.BUSINESS,
+    ).update(assignee=project.business_owner)
+    FollowUpTask.objects.filter(
+        project=project, role=FollowUpTask.Role.TECHNICAL,
+    ).update(assignee=project.technical_owner)
+    if project.is_active:
+        sync_project_followup_tasks(project)
+    primary_id = project.customer.projects.order_by('created_at', 'id').values_list('id', flat=True).first()
+    if primary_id == project.id:
+        project.customer.progress = project.progress
+        project.customer.plan = project.plan
+        for field in ('country', 'province', 'city', 'district'):
+            setattr(project.customer, field, getattr(project, field))
+        project.customer.save(update_fields=('progress', 'plan', 'country', 'province', 'city', 'district', 'updated_at'))
+    project = Project.objects.select_related(
+        'customer', 'project_type', 'business_owner__employee_profile',
+        'technical_owner__employee_profile',
+    ).get(id=project.id)
+    return JsonResponse({'project': serialize_project(project)})
+
+
+@login_required
+@require_http_methods(['GET', 'POST'])
+def customer_partnerships(request, customer_id):
+    customer, error = customer_for_business_request(
+        request.user, customer_id, manage=request.method == 'POST',
+    )
+    if error:
+        return error
+    if request.method == 'GET':
+        return JsonResponse({'partnerships': [serialize_partnership_identity(item) for item in customer.partnership_identities.all()]})
+    payload, error_response = parse_payload(request)
+    if error_response:
+        return error_response
+    identity_type = str(payload.get('type') or '').strip()
+    valid_types = dict(PartnershipIdentity.IdentityType.choices)
+    if identity_type not in valid_types:
+        return JsonResponse({'error': '请选择有效的合作身份'}, status=400)
+    with transaction.atomic():
+        PartnershipIdentity.objects.select_for_update().filter(
+            customer=customer,
+            is_active=True,
+        ).exclude(identity_type=identity_type).update(is_active=False)
+        item, created = PartnershipIdentity.objects.get_or_create(
+            customer=customer,
+            identity_type=identity_type,
+            defaults={
+                'notes': str(payload.get('notes') or '').strip()[:300],
+                'created_by': request.user,
+            },
+        )
+        if not created:
+            item.is_active = True
+            item.notes = str(payload.get('notes') or item.notes).strip()[:300]
+            item.save(update_fields=('is_active', 'notes', 'updated_at'))
+    if customer.cooperation_status != Customer.CooperationStatus.COOPERATING:
+        customer.cooperation_status = Customer.CooperationStatus.COOPERATING
+        customer.save(update_fields=('cooperation_status', 'updated_at'))
+    return JsonResponse({'partnership': serialize_partnership_identity(item)}, status=201 if created else 200)
+
+
+@login_required
+@require_http_methods(['PATCH', 'DELETE'])
+def partnership_detail(request, identity_id):
+    item = get_object_or_404(PartnershipIdentity.objects.select_related('customer'), id=identity_id)
+    if not can_view_customer(request.user, item.customer):
+        return JsonResponse({'error': '无权查看该合作身份'}, status=403)
+    if not can_manage_commercial_records(request.user):
+        return JsonResponse({'error': '只有商务人员或超级管理员可以维护合作身份'}, status=403)
+    if request.method == 'DELETE':
+        item.is_active = False
+        item.save(update_fields=('is_active', 'updated_at'))
+        return JsonResponse({'archived': True})
+    payload, error_response = parse_payload(request)
+    if error_response:
+        return error_response
+    item.notes = str(payload.get('notes') or '').strip()[:300]
+    requested_active = bool(payload.get('isActive', item.is_active))
+    with transaction.atomic():
+        if requested_active:
+            PartnershipIdentity.objects.select_for_update().filter(
+                customer=item.customer,
+                is_active=True,
+            ).exclude(id=item.id).update(is_active=False)
+        item.is_active = requested_active
+        item.save(update_fields=('notes', 'is_active', 'updated_at'))
+    return JsonResponse({'partnership': serialize_partnership_identity(item)})
+
+
+def authorization_payload(payload, item=None):
+    level = str(payload.get('level', item.level if item else '') or '').strip()
+    province = str(payload.get('province', item.province if item else '') or '').strip()
+    city = str(payload.get('city', item.city if item else '') or '').strip()
+    district = str(payload.get('district', item.district if item else '') or '').strip()
+    if level not in dict(AgencyAuthorization.Level.choices):
+        return None, '请选择有效的代理级别'
+    if not province:
+        return None, '授权区域必须选择省份'
+    if level == AgencyAuthorization.Level.PROVINCE and (city or district):
+        return None, '省级代理只能填写省份，不能同时限定市或区县'
+    if level == AgencyAuthorization.Level.CITY and (not city or district):
+        return None, '市级代理必须填写省份和城市，不能填写区县'
+    if level == AgencyAuthorization.Level.DISTRICT and (not city or not district):
+        return None, '区县代理必须完整填写省、市、区县'
+    effective_date = parse_date(str(payload.get('effectiveDate', item.effective_date if item else '') or ''))
+    expiry_date = parse_date(str(payload.get('expiryDate', item.expiry_date if item else '') or ''))
+    if not effective_date or not expiry_date:
+        return None, '请填写有效的生效和到期日期'
+    if expiry_date < effective_date:
+        return None, '到期日期不能早于生效日期'
+    agreement_status = str(payload.get('agreementStatus', item.agreement_status if item else AgencyAuthorization.AgreementStatus.INTENT))
+    if agreement_status not in dict(AgencyAuthorization.AgreementStatus.choices):
+        return None, '请选择有效的协议状态'
+    product_scope = str(payload.get('productScope', item.product_scope if item else '') or '').strip()
+    if not product_scope:
+        return None, '请填写授权产品或业务范围'
+    return {
+        'level': level, 'province': province, 'city': city, 'district': district,
+        'is_exclusive': bool(payload.get('isExclusive', item.is_exclusive if item else False)),
+        'product_scope': product_scope[:300],
+        'effective_date': effective_date, 'expiry_date': expiry_date,
+        'agreement_status': agreement_status,
+        'agreement_number': str(payload.get('agreementNumber', item.agreement_number if item else '') or '').strip()[:100],
+    }, ''
+
+
+def regions_overlap(left, right):
+    if left['province'] != right.province:
+        return False
+    if left['city'] and right.city and left['city'] != right.city:
+        return False
+    if left['district'] and right.district and left['district'] != right.district:
+        return False
+    return True
+
+
+def authorization_conflict(values, *, exclude_id=None):
+    candidates = AgencyAuthorization.objects.select_related('customer').filter(
+        province=values['province'],
+        effective_date__lte=values['expiry_date'],
+        expiry_date__gte=values['effective_date'],
+    ).exclude(
+        agreement_status__in=(
+            AgencyAuthorization.AgreementStatus.TERMINATED,
+            AgencyAuthorization.AgreementStatus.EXPIRED,
+        ),
+    )
+    if exclude_id:
+        candidates = candidates.exclude(id=exclude_id)
+    requested_scope = values['product_scope'].strip().lower()
+    for existing in candidates:
+        if not regions_overlap(values, existing):
+            continue
+        existing_scope = existing.product_scope.strip().lower()
+        same_scope = (
+            requested_scope == existing_scope
+            or '全部' in requested_scope
+            or '全部' in existing_scope
+        )
+        if same_scope and (values['is_exclusive'] or existing.is_exclusive):
+            return existing
+    return None
+
+
+@login_required
+@require_http_methods(['GET', 'POST'])
+def customer_authorizations(request, customer_id):
+    customer, error = customer_for_business_request(
+        request.user, customer_id, manage=request.method == 'POST',
+    )
+    if error:
+        return error
+    if request.method == 'GET':
+        items = customer.agency_authorizations.select_related('customer')
+        return JsonResponse({'authorizations': [serialize_agency_authorization(item) for item in items]})
+    payload, error_response = parse_payload(request)
+    if error_response:
+        return error_response
+    values, validation_error = authorization_payload(payload)
+    if validation_error:
+        return JsonResponse({'error': validation_error}, status=400)
+    conflict = authorization_conflict(values)
+    if conflict:
+        return JsonResponse({
+            'error': f'授权冲突：{conflict.customer.name} 已在 {conflict.region_label} 拥有重叠的{conflict.get_level_display()}授权，请先核对独家范围和有效期。',
+            'conflictAuthorizationId': conflict.id,
+        }, status=409)
+    item = AgencyAuthorization.objects.create(customer=customer, created_by=request.user, **values)
+    identity_map = {
+        AgencyAuthorization.Level.PROVINCE: PartnershipIdentity.IdentityType.PROVINCIAL_AGENT,
+        AgencyAuthorization.Level.CITY: PartnershipIdentity.IdentityType.CITY_AGENT,
+        AgencyAuthorization.Level.DISTRICT: PartnershipIdentity.IdentityType.DISTRICT_AGENT,
+    }
+    PartnershipIdentity.objects.get_or_create(
+        customer=customer,
+        identity_type=identity_map[item.level],
+        defaults={'created_by': request.user},
+    )
+    if customer.cooperation_status != Customer.CooperationStatus.COOPERATING:
+        customer.cooperation_status = Customer.CooperationStatus.COOPERATING
+        customer.save(update_fields=('cooperation_status', 'updated_at'))
+    item = AgencyAuthorization.objects.select_related('customer').get(id=item.id)
+    return JsonResponse({'authorization': serialize_agency_authorization(item)}, status=201)
+
+
+@login_required
+@require_http_methods(['PATCH', 'DELETE'])
+def authorization_detail(request, authorization_id):
+    item = get_object_or_404(AgencyAuthorization.objects.select_related('customer'), id=authorization_id)
+    if not can_view_customer(request.user, item.customer):
+        return JsonResponse({'error': '无权查看该代理授权'}, status=403)
+    if not can_manage_commercial_records(request.user):
+        return JsonResponse({'error': '只有商务人员或超级管理员可以维护代理授权'}, status=403)
+    if request.method == 'DELETE':
+        item.agreement_status = AgencyAuthorization.AgreementStatus.TERMINATED
+        item.save(update_fields=('agreement_status', 'updated_at'))
+        return JsonResponse({'terminated': True})
+    payload, error_response = parse_payload(request)
+    if error_response:
+        return error_response
+    values, validation_error = authorization_payload(payload, item)
+    if validation_error:
+        return JsonResponse({'error': validation_error}, status=400)
+    conflict = authorization_conflict(values, exclude_id=item.id)
+    if conflict:
+        return JsonResponse({
+            'error': f'授权冲突：{conflict.customer.name} 的 {conflict.region_label} 授权与本次修改重叠。',
+            'conflictAuthorizationId': conflict.id,
+        }, status=409)
+    for field, value in values.items():
+        setattr(item, field, value)
+    item.save()
+    return JsonResponse({'authorization': serialize_agency_authorization(item)})
+
+
+def contract_payload(payload, customer, item=None):
+    title = str(payload.get('title', item.title if item else '') or '').strip()
+    if not title:
+        return None, '请填写合同名称'
+    status = str(payload.get('status', item.status if item else BusinessContract.Status.INTENT))
+    if status not in dict(BusinessContract.Status.choices):
+        return None, '请选择有效的合同状态'
+    project_id = payload.get('projectId', item.project_id if item else None)
+    project = None
+    if project_id not in ('', None):
+        project = customer.projects.filter(id=project_id).first()
+        if not project:
+            return None, '所选项目不属于当前客户'
+    parsed_dates = {}
+    for field, key in (('signed_date', 'signedDate'), ('effective_date', 'effectiveDate'), ('expiry_date', 'expiryDate')):
+        raw = payload.get(key, getattr(item, field) if item else '')
+        if raw in ('', None):
+            parsed_dates[field] = None
+        else:
+            value = parse_date(str(raw))
+            if not value:
+                return None, '合同日期格式不正确'
+            parsed_dates[field] = value
+    if parsed_dates['effective_date'] and parsed_dates['expiry_date'] and parsed_dates['expiry_date'] < parsed_dates['effective_date']:
+        return None, '合同到期日期不能早于生效日期'
+    amount, amount_error = project_amount(payload.get('amount', item.amount if item else None), '合同金额')
+    if amount_error:
+        return None, amount_error
+    return {
+        'project': project,
+        'title': title[:150],
+        'contract_number': str(payload.get('contractNumber', item.contract_number if item else '') or '').strip()[:100],
+        'status': status,
+        'amount': amount,
+        'notes': str(payload.get('notes', item.notes if item else '') or '').strip(),
+        **parsed_dates,
+    }, ''
+
+
+@login_required
+@require_http_methods(['GET', 'POST'])
+def customer_contracts(request, customer_id):
+    customer, error = customer_for_business_request(
+        request.user, customer_id, manage=request.method == 'POST',
+    )
+    if error:
+        return error
+    if request.method == 'GET':
+        items = customer.business_contracts.select_related('project')
+        return JsonResponse({'contracts': [serialize_business_contract(item, request.user) for item in items]})
+    payload, error_response = parse_payload(request)
+    if error_response:
+        return error_response
+    values, validation_error = contract_payload(payload, customer)
+    if validation_error:
+        return JsonResponse({'error': validation_error}, status=400)
+    item = BusinessContract.objects.create(customer=customer, created_by=request.user, **values)
+    if item.status in (BusinessContract.Status.ACTIVE, BusinessContract.Status.RENEWED):
+        PartnershipIdentity.objects.get_or_create(
+            customer=customer,
+            identity_type=PartnershipIdentity.IdentityType.SIGNED_CUSTOMER,
+            defaults={'created_by': request.user},
+        )
+    if customer.cooperation_status != Customer.CooperationStatus.COOPERATING:
+        customer.cooperation_status = Customer.CooperationStatus.COOPERATING
+        customer.save(update_fields=('cooperation_status', 'updated_at'))
+    return JsonResponse({'contract': serialize_business_contract(item, request.user)}, status=201)
+
+
+@login_required
+@require_http_methods(['PATCH', 'DELETE'])
+def contract_detail(request, contract_id):
+    item = get_object_or_404(BusinessContract.objects.select_related('customer', 'project'), id=contract_id)
+    if not can_view_customer(request.user, item.customer):
+        return JsonResponse({'error': '无权查看该合同'}, status=403)
+    if not can_manage_commercial_records(request.user):
+        return JsonResponse({'error': '只有商务人员或超级管理员可以维护合同'}, status=403)
+    if request.method == 'DELETE':
+        item.status = BusinessContract.Status.TERMINATED
+        item.save(update_fields=('status', 'updated_at'))
+        return JsonResponse({'terminated': True})
+    payload, error_response = parse_payload(request)
+    if error_response:
+        return error_response
+    values, validation_error = contract_payload(payload, item.customer, item)
+    if validation_error:
+        return JsonResponse({'error': validation_error}, status=400)
+    for field, value in values.items():
+        setattr(item, field, value)
+    item.save()
+    return JsonResponse({'contract': serialize_business_contract(item, request.user)})
+
+
+def filtered_map_customers(request):
+    customers = accessible_customers(request.user).select_related(
+        'business_owner__employee_profile', 'technical_owner__employee_profile',
+    ).prefetch_related('projects', 'partnership_identities')
+    province = request.GET.get('province', '').strip()
+    city = request.GET.get('city', '').strip()
+    district = request.GET.get('district', '').strip()
+    grade = request.GET.get('grade', '').strip().upper()
+    progress = request.GET.get('progress', '').strip()
+    signed = request.GET.get('signed', '').strip()
+    owner_id = request.GET.get('ownerId', '').strip()
+    date_from = parse_date(request.GET.get('dateFrom', ''))
+    date_to = parse_date(request.GET.get('dateTo', ''))
+    if province:
+        customers = customers.filter(province=province)
+    if city:
+        customers = customers.filter(city=city)
+    if district:
+        customers = customers.filter(district=district)
+    if grade in ('A', 'B', 'C', 'D'):
+        customers = customers.filter(grade=grade)
+    if progress in PROGRESS_STAGES:
+        customers = customers.filter(projects__progress=progress, projects__is_active=True)
+    if signed in ('true', 'false'):
+        signed_query = Q(
+            partnership_identities__identity_type=PartnershipIdentity.IdentityType.SIGNED_CUSTOMER,
+            partnership_identities__is_active=True,
+        )
+        customers = customers.filter(signed_query) if signed == 'true' else customers.exclude(signed_query)
+    if owner_id.isdigit():
+        customers = customers.filter(Q(business_owner_id=owner_id) | Q(technical_owner_id=owner_id))
+    if date_from:
+        customers = customers.filter(created_at__date__gte=date_from)
+    if date_to:
+        customers = customers.filter(created_at__date__lte=date_to)
+    return customers.filter(country='').exclude(grade='D').distinct()
+
+
+@login_required
+@require_GET
+def regional_business_map(request):
+    map_view = request.GET.get('view', 'customers')
+    if map_view not in ('customers', 'agents'):
+        return JsonResponse({'error': '地图视图参数不正确'}, status=400)
+    customers = filtered_map_customers(request)
+    if map_view == 'customers':
+        regions = []
+        for item in customers.values('province').annotate(
+            count=Count('id', distinct=True),
+            last_follow_up=Max('projects__progress_updates__occurred_at'),
+        ).order_by('-count', 'province'):
+            if not item['province']:
+                continue
+            province_customers = customers.filter(province=item['province'])
+            regions.append({
+                'name': item['province'],
+                'count': item['count'],
+                'grades': {
+                    grade: province_customers.filter(grade=grade).count()
+                    for grade in ('A', 'B', 'C')
+                },
+                'signedCount': province_customers.filter(
+                    partnership_identities__identity_type=PartnershipIdentity.IdentityType.SIGNED_CUSTOMER,
+                    partnership_identities__is_active=True,
+                ).distinct().count(),
+                'lastFollowUpAt': item['last_follow_up'].isoformat() if item['last_follow_up'] else '',
+            })
+        region = request.GET.get('region', '').strip()
+        detail_customers = customers.filter(province=region)[:200] if region else Customer.objects.none()
+        return JsonResponse({
+            'view': 'customers',
+            'accessScope': 'internal' if is_internal_user(request.user) else 'authorized_agent',
+            'regions': regions,
+            'customers': [serialize_customer(item) for item in detail_customers],
+            'total': customers.count(),
+        })
+
+    authorizations = AgencyAuthorization.objects.select_related('customer')
+    if not is_internal_user(request.user):
+        authorizations = authorizations.filter(viewers=request.user)
+    level = request.GET.get('level', '').strip()
+    status = request.GET.get('status', '').strip()
+    exclusive = request.GET.get('exclusive', '').strip()
+    product = request.GET.get('product', '').strip()
+    expiry_within = request.GET.get('expiryWithin', '').strip()
+    province = request.GET.get('province', '').strip()
+    if level in dict(AgencyAuthorization.Level.choices):
+        authorizations = authorizations.filter(level=level)
+    if status in dict(AgencyAuthorization.AgreementStatus.choices):
+        authorizations = authorizations.filter(agreement_status=status)
+    if exclusive in ('true', 'false'):
+        authorizations = authorizations.filter(is_exclusive=exclusive == 'true')
+    if product:
+        authorizations = authorizations.filter(product_scope__icontains=product)
+    if expiry_within.isdigit():
+        authorizations = authorizations.filter(
+            expiry_date__lte=timezone.localdate() + timedelta(days=int(expiry_within)),
+        )
+    if province:
+        authorizations = authorizations.filter(province=province)
+    serialized = [serialize_agency_authorization(item) for item in authorizations]
+    grouped = {}
+    priority = {'expired': 5, 'expiring': 4, 'partial': 3, 'active': 2, 'inactive': 1}
+    for item in serialized:
+        bucket = grouped.setdefault(item['province'], {
+            'name': item['province'], 'count': 0, 'authorizationCount': 0,
+            'exclusiveCount': 0, 'coverageStatus': 'inactive', 'agents': [],
+        })
+        bucket['authorizationCount'] += 1
+        bucket['exclusiveCount'] += int(item['isExclusive'])
+        bucket['agents'].append(item)
+        if priority[item['coverageStatus']] > priority[bucket['coverageStatus']]:
+            bucket['coverageStatus'] = item['coverageStatus']
+    for region_name, bucket in grouped.items():
+        bucket['count'] = customers.filter(province=region_name).count()
+    return JsonResponse({
+        'view': 'agents',
+        'accessScope': 'internal' if is_internal_user(request.user) else 'authorized_agent',
+        'regions': list(grouped.values()),
+        'authorizations': serialized if province else [],
+        'total': len(serialized),
+        'legend': [
+            {'status': 'active', 'label': '有效覆盖'},
+            {'status': 'partial', 'label': '部分覆盖/非独家'},
+            {'status': 'expiring', 'label': '即将到期'},
+            {'status': 'expired', 'label': '到期异常'},
+            {'status': 'none', 'label': '暂无代理'},
+        ],
+    })

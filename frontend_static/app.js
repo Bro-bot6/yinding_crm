@@ -1,20 +1,194 @@
 const { createApp, nextTick } = Vue
 
+const CUSTOMER_SOURCES = Object.freeze(['抖音', '视频号', '服务号', '朋友介绍'])
+const CUSTOMER_SOURCE_CLASSES = Object.freeze({ 抖音: 'douyin', 视频号: 'wechat', 服务号: 'service-account', 朋友介绍: 'referral' })
+
 let themedPopoverSequence = 0
 const nextThemedPopoverId = prefix => `${prefix}-${++themedPopoverSequence}`
 const announceThemedPopover = id => window.dispatchEvent(new CustomEvent('yd-themed-popover-open', { detail: id }))
 
+function chineseDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''))
+  return match ? `${match[1]}年${match[2]}月${match[3]}日` : ''
+}
+
+function floatingMenuPosition(anchor, bounds, width, height) {
+  const gap = 7
+  const below = Math.max(0, bounds.bottom - anchor.bottom - gap)
+  const above = Math.max(0, anchor.top - bounds.top - gap)
+  const opensAbove = below < height && above > below
+  const available = opensAbove ? above : below
+  const actualHeight = Math.min(height, available)
+  const actualWidth = Math.min(width, bounds.right - bounds.left)
+  return {
+    left: Math.max(bounds.left, Math.min(anchor.left, bounds.right - actualWidth)),
+    top: opensAbove ? anchor.top - gap - actualHeight : anchor.bottom + gap,
+    width: actualWidth, maxHeight: actualHeight, opensAbove,
+  }
+}
+
+// Use one body-level portal in every browser, not native popover positioning.
+// Keep the original field as the anchor throughout this menu's lifetime.
+const FloatingMenuPositioner = {
+  mounted(menu, binding) {
+    const field = binding.value.field
+    const trigger = field.querySelector('.custom-select-trigger, .searchable-select-control, .themed-date-trigger')
+    if (!trigger) return
+    const scrollport = field.closest('.edit-scroll')
+    const initialStyle = getComputedStyle(menu)
+    // Never measure a popup's own percentage width: once in the top layer its
+    // containing block is the viewport, and cached/reopened nodes can retain it.
+    const calendar = menu.classList.contains('date-picker-popover')
+    const minimumWidth = parseFloat(initialStyle.getPropertyValue('--floating-min-width')) || (calendar ? 292 : 190)
+    const preferredHeight = parseFloat(initialStyle.getPropertyValue('--floating-max-height')) || (calendar ? 380 : 330)
+    const originalStyle = menu.getAttribute('style')
+    const legacyOptions = !menu.querySelector('[role="listbox"]') && !menu.classList.contains('date-picker-popover')
+    const popoverId = binding.instance.popoverId
+    const closeMenu = binding.value.close
+    announceThemedPopover(popoverId)
+    const closeOnPeer = event => { if (event.detail !== popoverId) closeMenu() }
+    window.addEventListener('yd-themed-popover-open', closeOnPeer)
+    const themeShell = field.closest('.app-shell')
+    const portal = menu.closest('.floating-menu-root')
+    let frame = 0
+    let disposed = false
+    menu.classList.add('floating-menu-layer')
+    menu.removeAttribute('popover')
+    menu.style.visibility = 'hidden'
+    menu._floatingTrigger = trigger
+    const update = () => {
+      if (disposed || !trigger.isConnected || !menu.isConnected) return
+      portal.dataset.theme = themeShell?.dataset.theme || 'business'
+      const anchor = trigger.getBoundingClientRect()
+      const viewport = window.visualViewport
+      const bounds = {
+        top: (viewport?.offsetTop || 0) + 8,
+        left: (viewport?.offsetLeft || 0) + 8,
+        right: (viewport?.offsetLeft || 0) + (viewport?.width || window.innerWidth) - 8,
+        bottom: (viewport?.offsetTop || 0) + (viewport?.height || window.innerHeight) - 8,
+      }
+      if (scrollport) {
+        const rect = scrollport.getBoundingClientRect()
+        bounds.top = Math.max(bounds.top, rect.top + 8)
+        bounds.bottom = Math.min(bounds.bottom, rect.bottom - 8)
+      }
+      const position = floatingMenuPosition(anchor, bounds, Math.max(anchor.width, minimumWidth), Math.min(menu.scrollHeight + 2, preferredHeight))
+      const nextStyle = {
+        left: `${position.left}px`, top: `${position.top}px`,
+        width: `${position.width}px`, maxHeight: `${position.maxHeight}px`,
+        visibility: anchor.bottom <= bounds.top || anchor.top >= bounds.bottom ? 'hidden' : 'visible',
+      }
+      for (const [key, value] of Object.entries(nextStyle)) {
+        if (menu.style[key] !== value) menu.style[key] = value
+      }
+      menu.dataset.placement = position.opensAbove ? 'top' : 'bottom'
+      if (legacyOptions) {
+        menu.id = popoverId
+        trigger.setAttribute('aria-expanded', 'true')
+        trigger.setAttribute('aria-controls', popoverId)
+        trigger.setAttribute('aria-haspopup', 'listbox')
+        menu.setAttribute('role', 'listbox')
+        menu.setAttribute('aria-label', field.querySelector('span')?.textContent || '选择选项')
+        menu.querySelectorAll('button').forEach(button => {
+          button.setAttribute('role', 'option')
+          button.setAttribute('aria-selected', String(button.classList.contains('selected')))
+        })
+      }
+    }
+    // Position changes do not fire ResizeObserver (e.g. scrolling, expanding a
+    // section or dialog animation). Track the live anchor while the menu is open.
+    const trackAnchor = () => {
+      if (disposed) return
+      update()
+      frame = requestAnimationFrame(trackAnchor)
+    }
+    const stopClick = event => event.stopPropagation()
+    const onKey = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        closeMenu()
+        trigger.focus()
+      } else if (legacyOptions && ['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault()
+        const options = [...menu.querySelectorAll('button:not(:disabled)')]
+        const index = options.indexOf(document.activeElement)
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length
+        options[next]?.focus()
+      }
+    }
+    const onTriggerKey = event => {
+      if (event.key === 'Escape') return onKey(event)
+      if (legacyOptions && ['ArrowDown', 'ArrowUp'].includes(event.key)) {
+        event.preventDefault()
+        const options = [...menu.querySelectorAll('button:not(:disabled)')]
+        const selected = menu.querySelector('button.selected')
+        ;(selected || (event.key === 'ArrowDown' ? options[0] : options.at(-1)))?.focus()
+      }
+    }
+    menu.addEventListener('click', stopClick)
+    menu.addEventListener('keydown', onKey)
+    trigger.addEventListener('keydown', onTriggerKey)
+    update()
+    frame = requestAnimationFrame(trackAnchor)
+    menu._floatingUpdate = update
+    menu._floatingClose = () => { closeMenu(); trigger.focus() }
+    menu._floatingCleanup = () => {
+      disposed = true
+      cancelAnimationFrame(frame)
+      menu.removeEventListener('click', stopClick)
+      menu.removeEventListener('keydown', onKey)
+      trigger.removeEventListener('keydown', onTriggerKey)
+      window.removeEventListener('yd-themed-popover-open', closeOnPeer)
+      if (legacyOptions) trigger.setAttribute('aria-expanded', 'false')
+      menu.classList.remove('floating-menu-layer')
+      if (originalStyle === null) menu.removeAttribute('style')
+      else menu.setAttribute('style', originalStyle)
+      delete menu.dataset.placement
+      delete menu._floatingTrigger
+    }
+  },
+  updated(menu) { menu._floatingUpdate?.() },
+  beforeUnmount(menu) { menu._floatingCleanup?.() },
+}
+
+// Vue owns the portal and its anchor. Moving v-if nodes by hand leaves Vue's
+// next insertion point in the old detached parent on the second open.
+const FloatingMenu = {
+  inheritAttrs: false,
+  props: { ownerId: { type: String, default: '' } },
+  emits: ['close'],
+  data() { return { popoverId: this.ownerId || nextThemedPopoverId('floating') } },
+  mounted() {
+    FloatingMenuPositioner.mounted(this.$refs.menu, {
+      instance: this,
+      value: {
+        field: this.$refs.anchor.parentElement,
+        close: () => this.$emit('close'),
+      },
+    })
+  },
+  updated() { FloatingMenuPositioner.updated(this.$refs.menu) },
+  beforeUnmount() { FloatingMenuPositioner.beforeUnmount(this.$refs.menu) },
+  template: `<span ref="anchor" class="floating-menu-anchor" aria-hidden="true"></span><Teleport to="body"><div class="app-shell floating-menu-root" :data-theme="$root.theme"><div ref="menu" v-bind="$attrs"><slot /></div></div></Teleport>`,
+}
+
 const ThemedSelect = {
+  components: { FloatingMenu },
   props: {
     modelValue: { type: [String, Number], default: '' },
     label: { type: String, required: true },
     options: { type: Array, default: () => [] },
     placeholder: { type: String, default: '请选择' },
+    searchable: { type: Boolean, default: false },
+    searchPlaceholder: { type: String, default: '输入关键词搜索' },
     required: { type: Boolean, default: false },
+    disabled: { type: Boolean, default: false },
+    matchWidth: { type: Boolean, default: false },
   },
   emits: ['update:modelValue'],
   data() {
-    return { open: false, popoverId: nextThemedPopoverId('select') }
+    return { open: false, activeIndex: -1, searchQuery: '', popoverId: nextThemedPopoverId('select') }
   },
   computed: {
     selectedOption() {
@@ -23,10 +197,17 @@ const ThemedSelect = {
     selectedLabel() {
       return this.selectedOption?.label || this.placeholder
     },
+    visibleOptions() {
+      const word = this.searchQuery.trim().toLocaleLowerCase('zh-CN')
+      if (!this.searchable || !word) return this.options
+      return this.options.filter(option => `${option.label || ''} ${option.detail || ''} ${option.value || ''}`.toLocaleLowerCase('zh-CN').includes(word))
+    },
   },
   mounted() {
     this.closeOnDocumentClick = () => { this.open = false }
-    this.closeOnEscape = event => { if (event.key === 'Escape') this.open = false }
+    this.closeOnEscape = event => {
+      if (event.key === 'Escape' && this.open) this.close(true)
+    }
     this.closeOnPeerOpen = event => { if (event.detail !== this.popoverId) this.open = false }
     document.addEventListener('click', this.closeOnDocumentClick)
     window.addEventListener('keydown', this.closeOnEscape)
@@ -39,36 +220,84 @@ const ThemedSelect = {
   },
   methods: {
     toggle() {
+      if (this.disabled) return
       const shouldOpen = !this.open
-      if (shouldOpen) announceThemedPopover(this.popoverId)
-      this.open = shouldOpen
+      if (!shouldOpen) return this.close()
+      this.openMenu(this.selectedOption ? this.visibleOptions.indexOf(this.selectedOption) : 0, false)
+    },
+    openMenu(index = 0, focusOption = true) {
+      if (this.disabled || !this.options.length) return
+      announceThemedPopover(this.popoverId)
+      this.open = true
+      this.searchQuery = ''
+      this.activeIndex = Math.max(0, Math.min(index, this.visibleOptions.length - 1))
+      if (focusOption) this.focusActiveOption()
+      else if (this.searchable) nextTick(() => this.$refs.searchInput?.focus())
+    },
+    close(restoreFocus = false) {
+      this.open = false
+      this.activeIndex = -1
+      this.searchQuery = ''
+      if (restoreFocus) nextTick(() => this.$refs.trigger?.focus())
+    },
+    focusActiveOption() {
+      nextTick(() => this.$refs.optionButtons?.[this.activeIndex]?.focus())
+    },
+    moveActive(step) {
+      if (!this.open) return this.openMenu(step > 0 ? 0 : this.visibleOptions.length - 1)
+      if (!this.visibleOptions.length) return
+      this.activeIndex = (this.activeIndex + step + this.visibleOptions.length) % this.visibleOptions.length
+      this.focusActiveOption()
+    },
+    moveTo(index) {
+      if (!this.visibleOptions.length) return
+      this.activeIndex = Math.max(0, Math.min(index, this.visibleOptions.length - 1))
+      this.focusActiveOption()
+    },
+    onSearchInput() {
+      this.activeIndex = this.visibleOptions.length ? 0 : -1
+    },
+    moveFromSearch(step) {
+      if (!this.visibleOptions.length) return
+      this.activeIndex = step > 0 ? 0 : this.visibleOptions.length - 1
+      this.focusActiveOption()
+    },
+    selectActiveFromSearch() {
+      const option = this.visibleOptions[this.activeIndex]
+      if (option) this.select(option)
     },
     select(option) {
       this.$emit('update:modelValue', option.value)
-      this.open = false
+      this.close(true)
     },
   },
   template: `
-    <div class="custom-select-field themed-select-field" @click.stop>
+    <div class="custom-select-field themed-select-field" :class="{ disabled }" @click.stop>
       <span>{{ label }} <b v-if="required">必填</b></span>
-      <button type="button" class="custom-select-trigger" :class="{ active: open }" :aria-expanded="String(open)" aria-haspopup="listbox" @click="toggle"><b>{{ selectedLabel }}</b><i></i></button>
-      <div v-if="open" class="custom-select-menu themed-select-menu" role="listbox">
-        <button v-for="option in options" :key="String(option.value)" type="button" role="option" :aria-selected="String(option === selectedOption)" :class="{ selected: option === selectedOption }" @click="select(option)"><span><b>{{ option.label }}</b><small v-if="option.detail">{{ option.detail }}</small></span><i>✓</i></button>
-      </div>
+      <button ref="trigger" type="button" class="custom-select-trigger" :class="{ active: open }" :disabled="disabled" :aria-label="label" :aria-expanded="String(open)" :aria-controls="popoverId" aria-haspopup="listbox" @click="toggle" @keydown.down.prevent="openMenu(selectedOption ? visibleOptions.indexOf(selectedOption) : 0)" @keydown.up.prevent="openMenu(selectedOption ? visibleOptions.indexOf(selectedOption) : visibleOptions.length - 1)"><b>{{ selectedLabel }}</b><i></i></button>
+      <floating-menu v-if="open" :owner-id="popoverId" @close="close(true)" class="custom-select-menu themed-select-menu" :style="matchWidth ? { '--floating-min-width': '1' } : null" @keydown.tab="close()">
+        <input v-if="searchable" ref="searchInput" v-model="searchQuery" class="themed-select-search" type="search" role="searchbox" :aria-label="searchPlaceholder" :placeholder="searchPlaceholder" autocomplete="off" @input="onSearchInput" @keydown.down.prevent="moveFromSearch(1)" @keydown.up.prevent="moveFromSearch(-1)" @keydown.enter.prevent="selectActiveFromSearch" @keydown.esc.prevent.stop="close(true)" />
+        <div :id="popoverId" class="themed-select-options" role="listbox" :aria-label="label">
+        <button v-for="(option, optionIndex) in visibleOptions" ref="optionButtons" :key="String(option.value)" type="button" role="option" :tabindex="optionIndex === activeIndex ? 0 : -1" :aria-selected="String(option === selectedOption)" :class="{ selected: option === selectedOption, focused: optionIndex === activeIndex }" @focus="activeIndex = optionIndex" @click="select(option)" @keydown.down.prevent="moveActive(1)" @keydown.up.prevent="moveActive(-1)" @keydown.home.prevent="moveTo(0)" @keydown.end.prevent="moveTo(visibleOptions.length - 1)" @keydown.enter.prevent="select(option)" @keydown.space.prevent="select(option)" @keydown.esc.prevent.stop="close(true)"><span><b>{{ option.label }}</b><small v-if="option.detail">{{ option.detail }}</small></span><i>✓</i></button>
+        <p v-if="searchable && !visibleOptions.length" class="themed-select-empty">没有匹配的选项</p>
+        </div>
+      </floating-menu>
     </div>
   `,
 }
 
 const ThemedDatePicker = {
+  components: { FloatingMenu },
   props: {
     modelValue: { type: String, default: '' },
     label: { type: String, required: true },
-    placeholder: { type: String, default: '年 / 月 / 日' },
+    placeholder: { type: String, default: '年/月/日' },
     min: { type: String, default: '' },
     max: { type: String, default: '' },
     required: { type: Boolean, default: false },
     dateTime: { type: Boolean, default: false },
     align: { type: String, default: 'left' },
+    disabled: { type: Boolean, default: false },
   },
   emits: ['update:modelValue'],
   data() {
@@ -86,7 +315,7 @@ const ThemedDatePicker = {
     },
     displayValue() {
       if (!this.dateValue) return ''
-      const formattedDate = this.dateValue.split('-').join(' / ')
+      const formattedDate = chineseDate(this.dateValue)
       if (!this.dateTime) return formattedDate
       const time = String(this.modelValue || '').slice(11, 16)
       return time ? `${formattedDate}  ${time}` : formattedDate
@@ -140,6 +369,7 @@ const ThemedDatePicker = {
       return `${year}-${month}-${day}`
     },
     toggle() {
+      if (this.disabled) return
       if (this.open) {
         this.open = false
         return
@@ -161,7 +391,10 @@ const ThemedDatePicker = {
     selectDate(value) {
       if (this.isDisabled(value)) return
       this.$emit('update:modelValue', this.dateTime ? `${value}T${this.draftTime}` : value)
-      if (!this.dateTime) this.open = false
+      if (!this.dateTime) {
+        this.open = false
+        nextTick(() => this.$el.querySelector('.themed-date-trigger')?.focus())
+      }
     },
     updateTime(event) {
       const value = event.target.value.replace(/[^0-9:]/g, '').slice(0, 5)
@@ -176,28 +409,31 @@ const ThemedDatePicker = {
     },
   },
   template: `
-    <div class="date-picker-field themed-date-picker" :class="[{ 'date-time-picker': dateTime, 'align-right': align === 'right' }]" @click.stop>
-      <label><span>{{ label }} <b v-if="required">必填</b></span><input class="themed-date-trigger" :value="displayValue" type="text" readonly :required="required" :placeholder="placeholder" :aria-label="label" :aria-expanded="String(open)" aria-haspopup="dialog" :class="{ active: open }" @click="toggle" @keydown.enter.prevent="toggle" @keydown.space.prevent="toggle" /><i class="date-input-icon" aria-hidden="true"></i></label>
-      <div v-if="open" class="date-picker-popover" role="dialog" :aria-label="'选择' + label">
+    <div class="date-picker-field themed-date-picker" :class="[{ 'date-time-picker': dateTime, 'align-right': align === 'right', disabled }]" @click.stop>
+      <label><span>{{ label }} <b v-if="required">必填</b></span><input class="themed-date-trigger" :value="displayValue" type="text" readonly :required="required" :disabled="disabled" :placeholder="placeholder" :aria-label="label" :aria-expanded="String(open)" aria-haspopup="dialog" :class="{ active: open }" @click="toggle" @keydown.enter.prevent="toggle" @keydown.space.prevent="toggle" /><i class="date-input-icon" aria-hidden="true"></i></label>
+      <floating-menu v-if="open" :owner-id="popoverId" @close="open = false" class="date-picker-popover" role="dialog" :aria-label="'选择' + label">
         <header><button type="button" aria-label="上个月" @click="shiftMonth(-1)">‹</button><strong>{{ calendarTitle }}</strong><button type="button" aria-label="下个月" @click="shiftMonth(1)">›</button></header>
         <div class="date-picker-weekdays"><span v-for="weekday in weekdays" :key="weekday">{{ weekday }}</span></div>
         <div class="date-picker-days"><button v-for="day in calendarDays" :key="day.value" type="button" :disabled="day.disabled" :class="{ outside: !day.inMonth, today: day.isToday, selected: day.isSelected }" @click="selectDate(day.value)">{{ day.day }}</button></div>
         <div v-if="dateTime" class="date-time-editor"><span>具体时间</span><input :value="draftTime" inputmode="numeric" maxlength="5" placeholder="09:00" aria-label="具体时间，24小时制" @input="updateTime" /></div>
         <footer><button type="button" :disabled="isDisabled(todayValue)" @click="selectDate(todayValue)">今天</button><button v-if="modelValue" type="button" @click="clear">清除</button><button v-if="dateTime" type="button" @click="open = false">完成</button></footer>
-      </div>
+      </floating-menu>
     </div>
   `,
 }
 
 createApp({
-  components: { ThemedSelect, ThemedDatePicker },
+  mixins: [typeof PersonalWork !== 'undefined' ? PersonalWork : {}],
+  components: { ThemedSelect, ThemedDatePicker, FloatingMenu },
   data() {
     const allowedPages = ['overview', 'customers', 'heatmap', 'followups', 'updates', 'visitors', 'plans']
-    const hashPage = window.location.hash.replace(/^#\/?/, '')
+    const hashPage = window.location.hash.replace(/^#\/?/, '').split('?')[0]
     return {
       theme: localStorage.getItem('yd-theme') || 'minimal',
       activePage: allowedPages.includes(hashPage) ? hashPage : 'overview',
       customerPool: 'active',
+      savedCustomerId: null,
+      customerEditReturnContext: null,
       keyword: '',
       hoveredGrade: '',
       customerGrade: 'all',
@@ -209,13 +445,31 @@ createApp({
       dateFrom: '',
       dateTo: '',
       mapGrade: 'all',
+      mapView: 'customers',
+      mapRegions: [],
+      mapRegionCustomers: [],
+      mapRegionAgents: [],
+      mapLegend: [],
+      mapAccessScope: 'internal',
+      mapLoading: false,
+      selectedMapRegion: '',
+      mapFilters: { province: '', signed: '', progress: '', ownerId: '', dateFrom: '', dateTo: '', level: '', status: '', exclusive: '', product: '', expiryWithin: '' },
       showCreate: false,
       showCreateUnsavedConfirm: false,
       createSnapshot: '',
       savingCreate: false,
+      showBatchCustomerCreate: false,
+      batchCustomerRows: [],
+      batchCustomerRowErrors: {},
+      batchCustomerSaving: false,
+      batchCustomerRowSequence: 0,
       pageScrollLockY: 0,
       showEdit: false,
       showUnsavedConfirm: false,
+      showProjectNavigationConfirm: false,
+      pendingCustomerProjectId: null,
+      pendingCustomerProjectTarget: null,
+      customerDeepLinkHandled: false,
       editSnapshot: '',
       savingEdit: false,
       showCustomerDelete: false,
@@ -239,6 +493,49 @@ createApp({
       customerSchemeCalculation: null,
       customerMaterialExperiment: null,
       customerCanManageProject: false,
+      customerCanManageCommercial: false,
+      customerDetailProjects: [],
+      customerAssociatedProjects: [],
+      customerProjectsExpanded: false,
+      selectedCustomerProjectId: null,
+      customerPartnerships: [],
+      customerAuthorizations: [],
+      customerContracts: [],
+      customerAttachments: [],
+      customerRelationshipExpanded: false,
+      inlinePartnershipType: '',
+      inlineAuthorizationId: null,
+      inlineAuthorizationForm: { level: '', province: '', city: '', district: '', effectiveDate: '', expiryDate: '' },
+      inlineContractId: null,
+      inlineContractNumber: '',
+      showProjectAssociationPicker: false,
+      projectAssociationProjectId: '',
+      showPartnershipEditor: false,
+      editingPartnershipId: null,
+      partnershipForm: { type: 'customer', notes: '' },
+      partnershipIdentityOptions: [
+        { value: 'provincial_agent', label: '省级代理', detail: '省级区域合作' },
+        { value: 'city_agent', label: '市级代理', detail: '市级区域合作' },
+        { value: 'district_agent', label: '区 / 县级代理', detail: '区县区域合作' },
+        { value: 'partner', label: '事业合伙人', detail: '事业合伙合作关系' },
+      ],
+      wechatStatusOptions: [{ value: 'yes', label: '已添加' }, { value: 'no', label: '未添加' }, { value: 'rejected', label: '已添加未通过' }],
+      cooperationStatusOptions: [
+        { value: 'none', label: '未建立合作关系', detail: '仅维护普通客资与项目跟进' },
+        { value: 'cooperating', label: '已建立合作关系', detail: '显示合作身份与关联项目案例' },
+      ],
+      showProjectEditor: false,
+      editingProjectId: null,
+      projectForm: { name: '', projectTypeId: '', progress: '需求对接', ownerId: '', techId: '', plan: '', commercialNotes: '', quotedAmount: '', contractAmount: '' },
+      showAuthorizationEditor: false,
+      editingAuthorizationId: null,
+      authorizationForm: { level: 'province', province: '', city: '', district: '', isExclusive: false, productScope: '', effectiveDate: '', expiryDate: '', agreementStatus: 'intent', agreementNumber: '' },
+      showContractEditor: false,
+      editingContractId: null,
+      contractForm: { title: '', contractNumber: '', projectId: '', status: 'intent', amount: '', signedDate: '', effectiveDate: '', expiryDate: '', notes: '' },
+      businessRecordSaving: false,
+      actionConfirm: { open: false, title: '', message: '', confirmLabel: '确认', tone: 'danger' },
+      actionConfirmResolver: null,
       expandedCustomerProgressStage: '',
       expandedProgressIntervalKey: '',
       expandedProgressUpdateId: null,
@@ -330,43 +627,21 @@ createApp({
       ],
       navItems: [
         { id: 'overview', label: '经营总览', icon: '总' },
-        { id: 'customers', label: '全部客资', icon: '客', badge: '20' },
+        { id: 'customers', label: '全部客资', icon: '客', badge: '0' },
         { id: 'heatmap', label: '客户热力图', icon: '图' },
-        { id: 'followups', label: '跟进任务', icon: '跟' },
+        { id: 'followups', label: '我的客资', icon: '客', badge: '0' },
         { id: 'visitors', label: '来访接待', icon: '访' },
-        { id: 'plans', label: '明日安排', icon: '明' },
+        { id: 'plans', label: '我的日历', icon: '历' },
       ],
       metrics: [
-        { label: '有效客资总览', value: '20', change: 'A / B / C', note: '有效客资与等级构成', icon: '客', tone: 'blue', trend: 1, action: 'customers-summary' },
+        { label: '有效客资总览', value: '0', change: 'A 0 · B 0 · C 0', note: '等待读取真实客资数据', icon: '客', tone: 'blue', trend: 1, action: 'customers-summary' },
         { label: '每日进度更新', value: '0', change: '近 7 天', note: '暂无项目进度更新', icon: '更', tone: 'orange', trend: 0, action: 'progress-updates' },
         { label: '实施中项目', value: '0', change: '占 0%', note: '当前处于项目实施跟进阶段', icon: '施', tone: 'green', trend: 1, action: 'construction' },
       ],
-      customers: [
-        { name: '浙江恒筑工程', phone: '138****6672', source: '抖音', channel: '短视频私信', region: '浙江 · 杭州', grade: 'A', plan: '园区道路土凝岩施工方案', progress: '方案与报价', percent: 72, owner: '王经理', tech: '陈工', updated: '10分钟前', color: '#5b7cfa' },
-        { name: '张先生', phone: '186****3021', source: '视频号', channel: '直播间咨询', region: '广东 · 佛山', grade: 'A', plan: '厂区地坪改造方案', progress: '方案与报价', percent: 86, owner: '李经理', tech: '周工', updated: '35分钟前', color: '#8b5cf6' },
-        { name: '山东路达建设', phone: '159****4826', source: '抖音', channel: '广告投放', region: '山东 · 济南', grade: 'B', plan: '乡村道路硬化方案', progress: '合同签订', percent: 100, owner: '王经理', tech: '陈工', updated: '1小时前', color: '#19a974' },
-        { name: '刘工', phone: '177****9530', source: '视频号', channel: '自然搜索', region: '四川 · 成都', grade: 'B', plan: '景区步道材料建议', progress: '需求对接', percent: 38, owner: '赵经理', tech: '周工', updated: '2小时前', color: '#f59e0b' },
-        { name: '河南新材项目部', phone: '132****4178', source: '抖音', channel: '直播间咨询', region: '河南 · 郑州', grade: 'C', plan: '待现场参数确认', progress: '需求对接', percent: 20, owner: '李经理', tech: '待分配', updated: '昨天', color: '#0ea5e9' },
-        { name: '湖北诚远施工', phone: '180****8824', source: '朋友介绍', channel: '介绍人：陈先生', referrer: '陈先生', region: '湖北 · 武汉', grade: 'A', plan: '物流园重载道路方案', progress: '方案与报价', percent: 78, owner: '赵经理', tech: '陈工', updated: '昨天', color: '#ec4899' },
-        { name: '福建绿建工程', phone: '135****7641', source: '抖音', channel: '短视频私信', region: '福建 · 厦门', grade: 'B', plan: '滨海步道施工方案', progress: '客户深度沟通', percent: 44, owner: '王经理', tech: '周工', updated: '2天前', color: '#14b8a6' },
-        { name: '杭州森远建材', phone: '137****2189', source: '视频号', channel: '直播间咨询', region: '浙江 · 杭州', grade: 'B', plan: '仓储区地面加固方案', progress: '合同签订', percent: 100, owner: '李经理', tech: '陈工', updated: '2天前', color: '#6366f1' },
-        { name: '宁波海创建设', phone: '188****5503', source: '朋友介绍', channel: '介绍人：赵总', referrer: '赵总', region: '浙江 · 宁波', grade: 'A', plan: '港区道路耐磨方案', progress: '方案与报价', percent: 70, owner: '赵经理', tech: '周工', updated: '3天前', color: '#2563eb' },
-        { name: '绍兴陈先生', phone: '150****3927', source: '抖音', channel: '短视频私信', region: '浙江 · 绍兴', grade: 'C', plan: '庭院地面材料建议', progress: '需求对接', percent: 18, owner: '王经理', tech: '待分配', updated: '3天前', color: '#64748b' },
-        { name: '佛山鼎创建材', phone: '139****8046', source: '视频号', channel: '自然搜索', region: '广东 · 佛山', grade: 'B', plan: '厂房道路施工方案', progress: '技术验证', percent: 52, owner: '李经理', tech: '周工', updated: '4天前', color: '#0891b2' },
-        { name: '东莞黄工', phone: '181****6340', source: '抖音', channel: '直播间咨询', region: '广东 · 东莞', grade: 'C', plan: '园区步道材料建议', progress: '需求对接', percent: 32, owner: '赵经理', tech: '待分配', updated: '4天前', color: '#0d9488' },
-        { name: '青岛海岳工程', phone: '156****9175', source: '朋友介绍', channel: '介绍人：孙经理', referrer: '孙经理', region: '山东 · 青岛', grade: 'A', plan: '滨海道路土凝岩方案', progress: '合同签订', percent: 100, owner: '王经理', tech: '陈工', updated: '5天前', color: '#0284c7' },
-        { name: '临沂周先生', phone: '133****4612', source: '抖音', channel: '广告投放', region: '山东 · 临沂', grade: 'C', plan: '乡村庭院改造建议', progress: '需求对接', percent: 16, owner: '李经理', tech: '待分配', updated: '5天前', color: '#475569' },
-        { name: '江苏路联建设', phone: '189****2058', source: '视频号', channel: '直播间咨询', region: '江苏 · 南京', grade: 'B', plan: '市政辅路施工方案', progress: '技术验证', percent: 48, owner: '赵经理', tech: '陈工', updated: '6天前', color: '#7c3aed' },
-        { name: '苏州吴经理', phone: '151****7384', source: '抖音', channel: '短视频私信', region: '江苏 · 苏州', grade: 'C', plan: '厂区地坪需求评估', progress: '需求对接', percent: 28, owner: '王经理', tech: '周工', updated: '6天前', color: '#9333ea' },
-        { name: '洛阳厚土工程', phone: '158****3691', source: '朋友介绍', channel: '介绍人：王工', referrer: '王工', region: '河南 · 洛阳', grade: 'B', plan: '景区道路硬化方案', progress: '方案与报价', percent: 75, owner: '李经理', tech: '陈工', updated: '7天前', color: '#c2410c' },
-        { name: '成都蜀创建材', phone: '136****8420', source: '视频号', channel: '自然搜索', region: '四川 · 成都', grade: 'A', plan: '物流场地重载方案', progress: '方案与报价', percent: 84, owner: '赵经理', tech: '周工', updated: '7天前', color: '#ea580c' },
-        { name: '合肥安创建设', phone: '187****1265', source: '抖音', channel: '广告投放', region: '安徽 · 合肥', grade: 'B', plan: '园区道路改造方案', progress: '方案与报价', percent: 68, owner: '王经理', tech: '陈工', updated: '8天前', color: '#16a34a' },
-        { name: '石家庄赵工', phone: '152****5908', source: '视频号', channel: '直播间咨询', region: '河北 · 石家庄', grade: 'C', plan: '项目材料初步建议', progress: '需求对接', percent: 14, owner: '李经理', tech: '待分配', updated: '8天前', color: '#65a30d' },
-      ],
-      tasks: [
-        { time: '09:30', name: '浙江恒筑工程', action: '确认方案技术参数', level: 'urgent' },
-        { time: '11:00', name: '张先生', action: '回访报价反馈', level: 'important' },
-      ],
+      overviewStats: null,
+      overviewLoading: false,
+      overviewError: '',
+      customers: [],
       mapGrades: [
         { id: 'all', label: '全部客户' }, { id: 'A', label: 'A级客户' }, { id: 'B', label: 'B级客户' }, { id: 'C', label: 'C级客户' },
       ],
@@ -388,31 +663,9 @@ createApp({
         项目实施跟进: '组织技术交底、试验段及现场施工指导，协调项目问题。',
         售后维护与需求挖掘: '开展满意度回访，挖掘复购及转介绍机会。',
       },
-      provinceData: [
-        { name: '浙江省', all: 4, A: 2, B: 1, C: 1 },
-        { name: '广东省', all: 3, A: 1, B: 1, C: 1 },
-        { name: '山东省', all: 3, A: 1, B: 1, C: 1 },
-        { name: '江苏省', all: 2, A: 0, B: 1, C: 1 },
-        { name: '河南省', all: 2, A: 0, B: 1, C: 1 },
-        { name: '四川省', all: 2, A: 1, B: 1, C: 0 },
-        { name: '湖北省', all: 1, A: 1, B: 0, C: 0 },
-        { name: '福建省', all: 1, A: 0, B: 1, C: 0 },
-        { name: '安徽省', all: 1, A: 0, B: 1, C: 0 },
-        { name: '河北省', all: 1, A: 0, B: 0, C: 1 },
-      ],
-      followColumns: [
-        { title: '今日待跟进', tone: 'orange', items: [{ name: '浙江恒筑工程', grade: 'A', time: '09:30', action: '确认方案技术参数', owner: '王经理' }, { name: '张先生', grade: 'A', time: '11:00', action: '回访报价反馈', owner: '李经理' }] },
-        { title: '明日计划', tone: 'blue', items: [{ name: '山东路达建设', grade: 'B', time: '10:00', action: '沟通现场勘察安排', owner: '王经理' }, { name: '刘工', grade: 'B', time: '15:30', action: '确认项目预计方量', owner: '赵经理' }] },
-        { title: '已逾期', tone: 'red', items: [{ name: '河南新材项目部', grade: 'C', time: '逾期 2 天', action: '再次确认项目真实性', owner: '李经理' }] },
-      ],
-      plans: [
-        { title: '园区道路土凝岩施工方案', customer: '浙江恒筑工程', grade: 'A', percent: 82, status: '待客户确认', owner: '陈工', date: '7月15日更新' },
-        { title: '厂区地坪改造方案', customer: '张先生', grade: 'A', percent: 100, status: '方案已完成', owner: '周工', date: '7月14日更新' },
-        { title: '乡村道路硬化方案', customer: '山东路达建设', grade: 'B', percent: 56, status: '设计中', owner: '陈工', date: '7月15日更新' },
-        { title: '物流园重载道路方案', customer: '湖北诚远施工', grade: 'A', percent: 90, status: '报价中', owner: '陈工', date: '7月13日更新' },
-      ],
-      newCustomer: { name: '', phone: '', source: '抖音', referrer: '', province: '', city: '', district: '', grade: 'B', projectTypeId: '', progress: '需求对接', ownerId: '', owner: '', techId: '', tech: '', plan: '', description: '' },
-      editCustomer: { name: '', phone: '', source: '抖音', referrer: '', province: '', city: '', district: '', grade: 'B', projectTypeId: '', progress: '需求对接', ownerId: '', owner: '', techId: '', tech: '', plan: '', description: '' },
+      provinceData: [],
+      newCustomer: { name: '', phone: '', wechatStatus: 'no', source: '抖音', referrer: '', country: '', locationMode: 'domestic', province: '', city: '', district: '', grade: 'C', cooperationStatus: 'none', projectName: '', projectTypeId: '', progress: '需求对接', ownerId: '', owner: '', techId: '', tech: '', plan: '', description: '' },
+      editCustomer: { name: '', phone: '', wechatStatus: 'no', source: '抖音', referrer: '', country: '', locationMode: 'domestic', province: '', city: '', district: '', grade: 'C', cooperationStatus: 'none', projectName: '', projectTypeId: '', progress: '需求对接', ownerId: '', owner: '', techId: '', tech: '', plan: '', description: '' },
     }
   },
   computed: {
@@ -442,7 +695,7 @@ createApp({
       return candidates.filter((employee, index, list) => list.findIndex(item => item.id === employee.id) === index)
     },
     visitorSourceOptions() {
-      return [...new Set(this.visitorRecords.map(record => record.customer.source).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh-CN'))
+      return [...CUSTOMER_SOURCES]
     },
     visitorSourceSelectOptions() {
       return [{ value: 'all', label: '全部来源' }, ...this.visitorSourceOptions.map(source => ({ value: source, label: source }))]
@@ -451,12 +704,18 @@ createApp({
       return [{ value: 'all', label: '全部人员' }, ...this.visitorHostOptions.map(employee => ({ value: String(employee.id), label: employee.display_name, detail: employee.username }))]
     },
     customerSourceSelectOptions() {
-      return ['抖音', '视频号', '朋友介绍'].map(source => ({ value: source, label: source }))
+      return CUSTOMER_SOURCES.map(source => ({ value: source, label: source }))
+    },
+    batchCustomerSourceOptions() {
+      return CUSTOMER_SOURCES.map(source => ({ value: source, label: source }))
+    },
+    batchCustomerFilledCount() {
+      return this.batchCustomerRows.filter(row => this.batchCustomerRowHasContent(row)).length
     },
     editCustomerSourceSelectOptions() {
       const options = [...this.customerSourceSelectOptions]
       if (this.editCustomer.source && !options.some(option => option.value === this.editCustomer.source)) {
-        options.unshift({ value: this.editCustomer.source, label: this.editCustomer.source })
+        options.unshift({ value: this.editCustomer.source, label: `${this.editCustomer.source}（历史来源，仅保留）` })
       }
       return options
     },
@@ -512,7 +771,7 @@ createApp({
       if (this.customerPool === 'dormant') return '低价值客资独立存放；重新评估后可修改为 A、B 或 C 类'
       return this.progressFilter === 'construction'
         ? '仅展示当前处于试验段、A段或B段施工阶段的项目'
-        : '统一查看和管理 A、B、C 类有效客户信息'
+        : '统一查看 A、B、C 类客资；D 类请进入沉淀客户查看'
     },
     reportingCustomers() {
       return this.customers.filter(customer => customer.grade !== 'D')
@@ -523,14 +782,48 @@ createApp({
     customerPoolCustomers() {
       return this.customerPool === 'dormant' ? this.dormantCustomers : this.reportingCustomers
     },
+    customerEmptyMessage() {
+      const today = this.formatLocalDate(new Date())
+      if (this.dateFrom === today && this.dateTo === today) {
+        const hasTodayCustomers = this.customerPoolCustomers.some(customer => (
+          (customer.createdDate || String(customer.createdAt || '').slice(0, 10)) === today
+        ))
+        return {
+          title: hasTodayCustomers ? '今天没有符合当前筛选条件的客资' : '今天暂无新录入客资',
+          description: '可调整筛选条件，或点击“重置筛选”查看全部日期的客资。',
+        }
+      }
+      if (this.customerPool === 'dormant' && !this.customerPoolCustomers.length) {
+        return { title: 'D 类沉淀池为空', description: '当前没有 D 类客户。' }
+      }
+      return { title: '没有找到匹配客资', description: '请尝试其他关键词或点击“重置筛选”' }
+    },
     currentPeriodLabel() {
-      const today = new Date()
-      const month = String(today.getMonth() + 1).padStart(2, '0')
-      const day = String(today.getDate()).padStart(2, '0')
-      return `近30天 · 截至 ${today.getFullYear()}-${month}-${day}`
+      const period = this.overviewStats?.period
+      if (period && typeof period === 'object') return `近${period.days}天 · 截至 ${chineseDate(period.endDate)}`
+      if (this.overviewState === 'error') return '统计周期暂不可用'
+      if (this.overviewState === 'empty') return '近30天 · 暂无真实数据'
+      return '近30天 · 正在读取实际数据'
+    },
+    overviewState() {
+      if (this.overviewError) return 'error'
+      if (this.overviewLoading || !this.overviewStats) return 'loading'
+      const stats = this.overviewStats && typeof this.overviewStats === 'object' ? this.overviewStats : {}
+      const customers = stats.customers && typeof stats.customers === 'object' ? stats.customers : {}
+      const projects = stats.projects && typeof stats.projects === 'object' ? stats.projects : {}
+      const visitors = stats.visitors && typeof stats.visitors === 'object' ? stats.visitors : {}
+      const followUps = stats.followUps && typeof stats.followUps === 'object' ? stats.followUps : {}
+      return [customers.total, projects.total, visitors.visits, visitors.people, followUps.total]
+        .some(value => Number(value || 0) > 0) ? 'ready' : 'empty'
     },
     todayDateValue() {
       return this.formatLocalDate(new Date())
+    },
+    newCustomerShowsFullProjectModules() {
+      return ['A', 'B'].includes(this.newCustomer.grade)
+    },
+    editCustomerShowsFullProjectModules() {
+      return ['A', 'B'].includes(this.editCustomer.grade)
     },
     recent30Customers() {
       const boundary = new Date()
@@ -642,30 +935,18 @@ createApp({
       return this.customerFollowUps.some(task => task.canCreateManual)
     },
     filteredCustomers() {
-      const word = this.keyword.trim().toLowerCase()
-      return this.customerPoolCustomers.filter(item => {
-        const matchesWord = !word || [item.name, item.phone, item.region, item.plan, item.description].some(value => String(value || '').toLowerCase().includes(word))
-        const matchesGrade = this.customerGrade === 'all' || item.grade === this.customerGrade
-        const matchesSource = this.sourceFilter === 'all' || item.source === this.sourceFilter
-        const matchesProjectType = this.projectTypeFilter === 'all' || this.customerHasProjectType(item, this.projectTypeFilter)
-        const matchesProgress = this.progressFilter === 'all' || item.progress === this.progressFilter
-        const location = this.locationParts(item)
-        const matchesProvince = this.provinceFilter === 'all' || location.province === this.provinceFilter
-        const matchesCity = this.cityFilter === 'all' || location.city === this.cityFilter
-        const createdDate = item.createdDate || String(item.createdAt || '').slice(0, 10)
-        const matchesDateFrom = !this.dateFrom || (createdDate && createdDate >= this.dateFrom)
-        const matchesDateTo = !this.dateTo || (createdDate && createdDate <= this.dateTo)
-        return matchesWord && matchesGrade && matchesSource && matchesProjectType && matchesProgress && matchesProvince && matchesCity && matchesDateFrom && matchesDateTo
-      }).sort((left, right) => {
-        const leftTime = Date.parse(left.createdAt || left.createdDate || '') || 0
-        const rightTime = Date.parse(right.createdAt || right.createdDate || '') || 0
+      return this.customerPoolCustomers.filter(item => this.customerMatchesCurrentFilters(item)).sort((left, right) => {
+        if (left.id === this.savedCustomerId) return -1
+        if (right.id === this.savedCustomerId) return 1
+        const leftTime = Date.parse(left.updatedAt || left.createdAt || left.createdDate || '') || 0
+        const rightTime = Date.parse(right.updatedAt || right.createdAt || right.createdDate || '') || 0
         return rightTime - leftTime || Number(right.id || 0) - Number(left.id || 0)
       })
     },
     provinceOptions() {
       const counts = new Map()
       this.customerPoolCustomers.forEach(customer => {
-        const province = this.locationParts(customer).province
+        const province = customer.country ? '' : this.locationParts(customer).province
         if (!province.includes('待完善')) counts.set(province, (counts.get(province) || 0) + 1)
       })
       return [...counts.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
@@ -683,11 +964,11 @@ createApp({
       return ['A', 'B', 'C'].map(value => ({
         value,
         label: `${value} 级客户`,
-        count: this.reportingCustomers.filter(customer => customer.grade === value).length,
+        count: this.customerPoolCustomers.filter(customer => customer.grade === value).length,
       }))
     },
     sourceFilterOptions() {
-      return ['抖音', '视频号', '朋友介绍'].map(value => ({
+      return CUSTOMER_SOURCES.map(value => ({
         value,
         label: value,
         count: this.customerPoolCustomers.filter(customer => customer.source === value).length,
@@ -750,33 +1031,48 @@ createApp({
       return city?.children || []
     },
     gradeStats() {
-      const total = this.reportingCustomers.length
+      const rawCounts = this.overviewStats?.customers?.gradeCounts
+      const counts = rawCounts && typeof rawCounts === 'object' && !Array.isArray(rawCounts) ? rawCounts : { A: 0, B: 0, C: 0 }
+      const total = Number(this.overviewStats?.customers?.total || 0)
       let cursor = 0
       return ['A', 'B', 'C'].map(grade => {
-        const value = this.reportingCustomers.filter(customer => customer.grade === grade).length
-        const ratio = total ? Math.round(value / total * 100) : 0
+        const value = Number(counts[grade] || 0)
+        const ratio = total ? value / total * 100 : 0
         const start = cursor
         cursor += ratio
+        const point = fraction => {
+          const radians = fraction / 100 * Math.PI * 2
+          return `${60 + 47 * Math.cos(radians)},${60 + 47 * Math.sin(radians)}`
+        }
         return {
           grade,
           value,
           ratio,
           start,
-          arc: ratio ? Math.max(ratio - 8, .8) : 0,
-          percent: `${ratio}%`,
+          path: value && total ? `M ${point(start)} A 47 47 0 0 1 ${point(start + ratio / 2)} A 47 47 0 0 1 ${point(start + ratio)}` : '',
+          percent: `${Math.round(ratio)}%`,
         }
       })
     },
     sourceStats() {
-      const sourceClasses = { 抖音: 'douyin', 视频号: 'wechat', 朋友介绍: 'referral' }
-      return ['抖音', '视频号', '朋友介绍'].map(name => ({
+      const sourceCounts = this.overviewStats?.customers?.sourceCounts
+      const countBySource = Object.fromEntries(
+        (Array.isArray(sourceCounts) ? sourceCounts : [])
+          .filter(item => item && typeof item === 'object')
+          .map(item => [String(item.name || ''), Number(item.count || 0)]),
+      )
+      return CUSTOMER_SOURCES.map(name => ({
         name,
-        value: this.recent30Customers.filter(customer => customer.source === name).length,
-        className: sourceClasses[name],
+        value: countBySource[name] || 0,
+        className: CUSTOMER_SOURCE_CLASSES[name],
       }))
     },
     topRegions() {
-      return this.provinceData.map(item => ({ name: item.name.replace(/省|市/g, ''), value: item.all })).sort((a, b) => b.value - a.value).slice(0, 6)
+      const regions = this.overviewStats?.customers?.regions
+      return (Array.isArray(regions) ? regions : [])
+        .filter(item => item && typeof item === 'object' && item.name)
+        .map(item => ({ name: String(item.name).replace(/省|市/g, ''), value: Number(item.count || 0) }))
+        .slice(0, 6)
     },
     progressBuckets() {
       const colors = ['#4f7cf3', '#6d67df', '#0ea98b', '#e49a24', '#da6b49', '#337fc4', '#16946f']
@@ -857,7 +1153,7 @@ createApp({
       }))
     },
     followSourceOptions() {
-      return [...new Set(this.followUpTasks.map(task => task.project.customer.source).filter(Boolean))].map(value => ({
+      return CUSTOMER_SOURCES.map(value => ({
         value,
         label: value,
         count: this.followUpTasks.filter(task => task.project.customer.source === value).length,
@@ -901,12 +1197,18 @@ createApp({
       )?.name || '全部员工'
     },
     rankedAreas() {
-      return this.provinceData.map(item => ({ name: item.name.replace(/省|市|壮族自治区/g, ''), value: item[this.mapGrade] || 0 })).sort((a, b) => b.value - a.value).slice(0, 6)
+      return this.mapRegions.map(item => ({
+        name: item.name.replace(/省|市|壮族自治区/g, ''),
+        value: this.mapView === 'customers' ? Number(item.count || 0) : Number(item.authorizationCount || 0),
+      })).sort((a, b) => b.value - a.value).slice(0, 6)
     },
     mapTotal() {
-      return this.provinceData.reduce((sum, item) => sum + (item[this.mapGrade] || 0), 0)
+      return this.mapRegions.reduce((sum, item) => sum + (
+        this.mapView === 'customers' ? Number(item.count || 0) : Number(item.authorizationCount || 0)
+      ), 0)
     },
     mapGradeLabel() {
+      if (this.mapView === 'agents') return '全国代理授权覆盖'
       return this.mapGrade === 'all' ? '全国全部客资分布' : `全国 ${this.mapGrade} 级客户分布`
     },
     topAreaStats() {
@@ -915,63 +1217,119 @@ createApp({
         percent: this.mapTotal ? `${Math.round(area.value / this.mapTotal * 100)}%` : '0%',
       }))
     },
+    customerExpiryReminderCount() {
+      return [...this.customerAuthorizations, ...this.customerContracts]
+        .filter(item => item.daysRemaining != null && item.daysRemaining <= 90).length
+    },
+    activeCustomerPartnerships() {
+      const visibleOptions = new Map(this.partnershipIdentityOptions.map(option => [option.value, option]))
+      return this.customerPartnerships
+        .filter(identity => identity.isActive && visibleOptions.has(identity.type))
+        .map(identity => ({ ...identity, label: visibleOptions.get(identity.type).label }))
+    },
+    currentPartnershipIdentityType() {
+      return this.inlinePartnershipType || this.activeCustomerPartnerships[0]?.type || ''
+    },
+    availablePartnershipIdentityOptions() {
+      const activeTypes = new Set(this.activeCustomerPartnerships.map(identity => identity.type))
+      return this.partnershipIdentityOptions.filter(option => !activeTypes.has(option.value))
+    },
+    activeAgentIdentity() {
+      const agentTypes = ['provincial_agent', 'city_agent', 'district_agent']
+      return this.activeCustomerPartnerships.find(identity => agentTypes.includes(identity.type)) || null
+    },
+    inlineAgentLevel() {
+      return ({ provincial_agent: 'province', city_agent: 'city', district_agent: 'district' })[this.activeAgentIdentity?.type] || ''
+    },
+    inlineAuthorizationPeriodLabel() {
+      const formatDate = value => {
+        const [year, month, day] = String(value || '').split('-')
+        return year && month && day ? `${year}年${Number(month)}月${Number(day)}日` : ''
+      }
+      const effective = formatDate(this.inlineAuthorizationForm.effectiveDate)
+      const expiry = formatDate(this.inlineAuthorizationForm.expiryDate)
+      return effective && expiry ? `从 ${effective} 到 ${expiry}` : '请选择生效和到期日期'
+    },
+    inlineAuthorizationProvinceOptions() {
+      return this.regionTree.map(item => ({ value: item.name, label: item.name }))
+    },
+    inlineAuthorizationCityOptions() {
+      const province = this.regionTree.find(item => item.name === this.inlineAuthorizationForm.province)
+      if (!province) return []
+      const children = province.children || []
+      const hasCityLevel = children.some(item => Array.isArray(item.children) && item.children.length)
+      const cities = hasCityLevel ? children : [{ name: province.name, code: province.code, children }]
+      return cities.map(item => ({ value: item.name, label: item.name }))
+    },
+    inlineAuthorizationDistrictOptions() {
+      const province = this.regionTree.find(item => item.name === this.inlineAuthorizationForm.province)
+      const children = province?.children || []
+      const hasCityLevel = children.some(item => Array.isArray(item.children) && item.children.length)
+      const cities = hasCityLevel ? children : [{ name: province?.name, children }]
+      const city = cities.find(item => item.name === this.inlineAuthorizationForm.city)
+      return (city?.children || []).map(item => ({ value: item.name, label: item.name }))
+    },
+    projectAssociationOptions() {
+      const associatedIds = new Set(this.customerAssociatedProjects.map(item => item.project?.id))
+      return this.customerProjects
+        .filter(project => !associatedIds.has(project.id))
+        .map(project => ({
+          value: project.id,
+          label: project.name,
+          detail: `项目 #${project.id} · ${project.customer?.name || '未知客户'} · ${project.progress}`,
+        }))
+    },
+    unfinishedAssociatedProjects() {
+      return this.customerAssociatedProjects.filter(association => association.project?.isActive !== false)
+    },
+    completedAssociatedProjects() {
+      return this.customerAssociatedProjects.filter(association => association.project?.isActive === false)
+    },
     overviewGradeCounts() {
-      return Object.fromEntries(
-        ['A', 'B', 'C'].map(grade => [
-          grade,
-          this.reportingCustomers.filter(customer => customer.grade === grade).length,
-        ]),
-      )
+      const counts = this.overviewStats?.customers?.gradeCounts
+      return counts && typeof counts === 'object' && !Array.isArray(counts) ? counts : { A: 0, B: 0, C: 0 }
     },
     trendChart() {
-      const today = new Date()
-      today.setHours(23, 59, 59, 999)
-      const start = new Date(today)
-      start.setDate(start.getDate() - 29)
-      start.setHours(0, 0, 0, 0)
-      const offsets = [0, 6, 12, 18, 24, 29]
-      const sources = [
-        { name: '抖音', className: 'line-main' },
-        { name: '视频号', className: 'line-second' },
-        { name: '朋友介绍', className: 'line-third' },
-      ]
-      const dates = offsets.map(offset => {
-        const value = new Date(start)
-        value.setDate(start.getDate() + offset)
-        if (offset === 29) value.setTime(today.getTime())
-        return value
-      })
-      const valuesBySource = sources.map(source => dates.map(point => (
-        this.recent30Customers.filter(customer => {
-          const created = new Date(customer.createdAt || customer.createdDate)
-          return customer.source === source.name && created <= point
-        }).length
-      )))
-      const maximum = Math.max(4, ...valuesBySource.flat())
-      const yFor = value => 200 - (value / maximum * 170)
+      const rawBuckets = this.overviewStats?.customers?.trendBuckets
+      const buckets = Array.isArray(rawBuckets) ? rawBuckets : []
+      const lineClasses = ['line-main', 'line-second', 'line-fourth', 'line-third']
+      const sources = CUSTOMER_SOURCES.map((name, index) => ({
+        name,
+        className: lineClasses[index % lineClasses.length],
+      }))
+      const valuesBySource = sources.map(source => buckets.map(bucket => Number(bucket.counts?.[source.name] || 0)))
+      const primaryValues = valuesBySource[0] || []
+      const actualMaximum = Math.max(0, ...valuesBySource.flat())
+      const tickStep = Math.max(1, Math.ceil(actualMaximum / 4))
+      const maximum = tickStep * 4
+      const yFor = value => 200 - (value / maximum * 180)
+      const formatDate = value => {
+        const [, month, day] = String(value || '').split('-')
+        return month && day ? `${Number(month)}/${Number(day)}` : value
+      }
+      const xFor = index => buckets.length > 1 ? index * (700 / (buckets.length - 1)) : 350
       return {
+        hasData: actualMaximum > 0,
         maximum,
-        ticks: [maximum, Math.round(maximum * .75), Math.round(maximum * .5), Math.round(maximum * .25), 0],
-        labels: dates.map(date => `${date.getMonth() + 1}月${date.getDate()}日`),
+        ticks: [maximum, maximum - tickStep, maximum - tickStep * 2, maximum - tickStep * 3, 0],
+        labels: buckets.map(bucket => `${formatDate(bucket.startDate)}–${formatDate(bucket.endDate)}`),
         series: sources.map((source, sourceIndex) => {
-          const points = valuesBySource[sourceIndex].map((value, index) => `${index * 140},${yFor(value)}`).join(' ')
-          return { ...source, points }
+          const values = valuesBySource[sourceIndex] || []
+          const points = values.map((value, index) => `${xFor(index)},${yFor(value)}`).join(' ')
+          return { ...source, values, points }
         }),
-        areaPoints: `0,220 ${valuesBySource[0].map((value, index) => `${index * 140},${yFor(value)}`).join(' ')} 700,220`,
+        areaPoints: primaryValues.length
+          ? `0,200 ${primaryValues.map((value, index) => `${xFor(index)},${yFor(value)}`).join(' ')} 700,200`
+          : '0,200 700,200',
       }
     },
     projectTypeStats() {
-      const effectiveProjects = this.customerProjects.filter(project => project.customer?.grade !== 'D' && project.isActive !== false)
-      const grouped = new Map()
-      effectiveProjects.forEach(project => {
-        const name = project.projectType?.name || '未分类'
-        grouped.set(name, (grouped.get(name) || 0) + 1)
-      })
-      const configured = this.projectTypes.filter(item => item.isActive && item.name !== '未分类').map(item => ({
-        ...item,
-        value: grouped.get(item.name) || 0,
-      }))
-      return configured.sort((a, b) => b.value - a.value || a.name.localeCompare(b.name))
+      const typeCounts = this.overviewStats?.projects?.typeCounts
+      return (Array.isArray(typeCounts) ? typeCounts : []).filter(item => item && typeof item === 'object' && item.name).map(item => ({
+        id: item.id || item.name,
+        name: String(item.name),
+        value: Number(item.count || 0),
+      })).sort((left, right) => Number(left.name === '未分类') - Number(right.name === '未分类'))
     },
     groupedProgressUpdates() {
       const groups = new Map()
@@ -1039,38 +1397,52 @@ createApp({
     },
     visitorSummary() {
       return {
-        visits: this.recent30VisitorRecords.length,
-        people: this.recent30VisitorRecords.reduce((sum, item) => sum + Number(item.visitorCount || 0), 0),
+        visits: Number(this.overviewStats?.visitors?.visits || 0),
+        people: Number(this.overviewStats?.visitors?.people || 0),
       }
     },
     visitorTrendChart() {
-      const today = new Date()
-      today.setHours(23, 59, 59, 999)
-      const start = new Date(today)
-      start.setDate(start.getDate() - 29)
-      start.setHours(0, 0, 0, 0)
-      const offsets = [0, 6, 12, 18, 24, 29]
-      const dates = offsets.map(offset => {
-        const value = new Date(start)
-        value.setDate(start.getDate() + offset)
-        if (offset === 29) value.setTime(today.getTime())
-        return value
-      })
-      const visits = dates.map(point => this.recent30VisitorRecords.filter(item => new Date(`${item.visitDate}T12:00:00`) <= point).length)
-      const people = dates.map(point => this.recent30VisitorRecords.filter(item => new Date(`${item.visitDate}T12:00:00`) <= point).reduce((sum, item) => sum + Number(item.visitorCount || 0), 0))
-      const maximum = Math.max(4, ...visits, ...people)
-      const yFor = value => 200 - (value / maximum * 170)
+      const rawBuckets = this.overviewStats?.visitors?.trendBuckets
+      const buckets = Array.isArray(rawBuckets) ? rawBuckets : []
+      const visits = buckets.map(bucket => Number(bucket.visits || 0))
+      const people = buckets.map(bucket => Number(bucket.people || 0))
+      const actualMaximum = Math.max(0, ...visits, ...people)
+      const tickStep = Math.max(1, Math.ceil(actualMaximum / 4))
+      const maximum = tickStep * 4
+      const yFor = value => 200 - (value / maximum * 180)
+      const formatDate = value => {
+        const [, month, day] = String(value || '').split('-')
+        return month && day ? `${Number(month)}/${Number(day)}` : value
+      }
+      const xFor = index => buckets.length > 1 ? index * (700 / (buckets.length - 1)) : 350
       return {
-        ticks: [maximum, Math.round(maximum * .75), Math.round(maximum * .5), Math.round(maximum * .25), 0],
-        labels: dates.map(date => `${date.getMonth() + 1}月${date.getDate()}日`),
-        visitsPoints: visits.map((value, index) => `${index * 140},${yFor(value)}`).join(' '),
-        peoplePoints: people.map((value, index) => `${index * 140},${yFor(value)}`).join(' '),
-        areaPoints: `0,220 ${visits.map((value, index) => `${index * 140},${yFor(value)}`).join(' ')} 700,220`,
+        hasData: actualMaximum > 0,
+        ticks: [maximum, maximum - tickStep, maximum - tickStep * 2, maximum - tickStep * 3, 0],
+        labels: buckets.map(bucket => `${formatDate(bucket.startDate)}–${formatDate(bucket.endDate)}`),
+        visits,
+        people,
+        visitsPoints: visits.map((value, index) => `${xFor(index)},${yFor(value)}`).join(' '),
+        peoplePoints: people.map((value, index) => `${xFor(index)},${yFor(value)}`).join(' '),
+        areaPoints: visits.length
+          ? `0,200 ${visits.map((value, index) => `${xFor(index)},${yFor(value)}`).join(' ')} 700,200`
+          : '0,200 700,200',
+      }
+    },
+    overviewTaskSummary() {
+      const source = this.overviewStats?.followUps
+      const followUps = source && typeof source === 'object' && !Array.isArray(source) ? source : {}
+      return {
+        total: Number(followUps.total || 0),
+        todayDue: Number(followUps.todayDue || 0),
+        tomorrowDue: Number(followUps.tomorrowDue || 0),
+        overdue: Number(followUps.overdue || 0),
+        completed: Number(followUps.completed || 0),
       }
     },
     hasOpenOverlay() {
       return Boolean(
         this.showCreate
+        || this.showBatchCustomerCreate
         || this.showEdit
         || this.showTaskComplete
         || this.showFollowTaskEdit
@@ -1153,6 +1525,21 @@ createApp({
         && String(project.projectType?.id || '') === targetId
       )) || String(customer.projectTypeId || '') === targetId
     },
+    customerMatchesCurrentFilters(item) {
+      const word = this.keyword.trim().toLowerCase()
+      const matchesWord = !word || [item.name, item.phone, item.region, item.projectName, item.plan, item.description].some(value => String(value || '').toLowerCase().includes(word))
+      const matchesGrade = this.customerGrade === 'all' || item.grade === this.customerGrade
+      const matchesSource = this.sourceFilter === 'all' || item.source === this.sourceFilter
+      const matchesProjectType = this.projectTypeFilter === 'all' || this.customerHasProjectType(item, this.projectTypeFilter)
+      const matchesProgress = this.progressFilter === 'all' || item.progress === this.progressFilter
+      const location = this.locationParts(item)
+      const matchesProvince = this.provinceFilter === 'all' || location.province === this.provinceFilter
+      const matchesCity = this.cityFilter === 'all' || location.city === this.cityFilter
+      const createdDate = item.createdDate || String(item.createdAt || '').slice(0, 10)
+      const matchesDateFrom = !this.dateFrom || (createdDate && createdDate >= this.dateFrom)
+      const matchesDateTo = !this.dateTo || (createdDate && createdDate <= this.dateTo)
+      return matchesWord && matchesGrade && matchesSource && matchesProjectType && matchesProgress && matchesProvince && matchesCity && matchesDateFrom && matchesDateTo
+    },
     openDormantCustomerPool() {
       this.customerPool = this.customerPool === 'dormant' ? 'active' : 'dormant'
       this.resetFilters()
@@ -1169,7 +1556,8 @@ createApp({
       this.activePage = page
       history.replaceState(null, '', `#/${page}`)
       window.scrollTo({ top: 0, behavior: 'smooth' })
-      if (page === 'heatmap') nextTick(() => this.renderMap())
+      if (page === 'heatmap') this.loadRegionalMap()
+      if (page === 'overview') this.loadOverviewStatistics()
       if (page === 'followups') this.loadFollowUpTasks()
       if (page === 'visitors') this.loadVisitorRecords()
       if (page === 'plans') {
@@ -1179,7 +1567,77 @@ createApp({
     },
     setMapGrade(grade) {
       this.mapGrade = grade
-      this.renderMap()
+      this.loadRegionalMap(this.selectedMapRegion)
+    },
+    setMapView(view) {
+      if (!['customers', 'agents'].includes(view) || this.mapView === view) return
+      this.mapView = view
+      this.selectedMapRegion = ''
+      this.mapRegionCustomers = []
+      this.mapRegionAgents = []
+      this.loadRegionalMap()
+    },
+    setMapFilter(key, value) {
+      this.mapFilters[key] = value
+      this.loadRegionalMap()
+    },
+    resetMapFilters() {
+      this.mapGrade = 'all'
+      this.mapFilters = { province: '', signed: '', progress: '', ownerId: '', dateFrom: '', dateTo: '', level: '', status: '', exclusive: '', product: '', expiryWithin: '' }
+      this.selectedMapRegion = ''
+      this.loadRegionalMap()
+    },
+    async loadRegionalMap(region = '') {
+      this.mapLoading = true
+      this.mapError = ''
+      try {
+        const params = new URLSearchParams({ view: this.mapView })
+        if (this.mapFilters.province) params.set('province', this.mapFilters.province)
+        if (region) {
+          params.set('province', region)
+          params.set('region', region)
+        }
+        if (this.mapView === 'customers') {
+          if (this.mapGrade !== 'all') params.set('grade', this.mapGrade)
+          if (this.mapFilters.signed) params.set('signed', this.mapFilters.signed)
+          if (this.mapFilters.progress) params.set('progress', this.mapFilters.progress)
+          if (this.mapFilters.ownerId) params.set('ownerId', this.mapFilters.ownerId)
+          if (this.mapFilters.dateFrom) params.set('dateFrom', this.mapFilters.dateFrom)
+          if (this.mapFilters.dateTo) params.set('dateTo', this.mapFilters.dateTo)
+        } else {
+          for (const key of ['level', 'status', 'exclusive', 'product', 'expiryWithin']) {
+            if (this.mapFilters[key]) params.set(key, this.mapFilters[key])
+          }
+        }
+        const response = await fetch(`/api/statistics/regional-business-map/?${params}`)
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || `地图数据加载失败（${response.status}）`)
+        this.mapAccessScope = data.accessScope || 'authorized_agent'
+        if (region) {
+          this.selectedMapRegion = region
+          if (this.mapView === 'customers') this.mapRegionCustomers = Array.isArray(data.customers) ? data.customers : []
+          else this.mapRegionAgents = Array.isArray(data.authorizations) ? data.authorizations : []
+        } else {
+          this.selectedMapRegion = ''
+          this.mapRegions = Array.isArray(data.regions) ? data.regions : []
+          this.mapLegend = Array.isArray(data.legend) ? data.legend : []
+          this.mapRegionCustomers = []
+          this.mapRegionAgents = []
+        }
+        nextTick(() => this.renderMap())
+      } catch (error) {
+        this.mapError = error.message || '区域地图数据加载失败'
+      } finally {
+        this.mapLoading = false
+      }
+    },
+    openMapCustomer(customer) {
+      const target = this.customers.find(item => item.id === customer?.id)
+      if (!target) return this.showToast('该客户不在当前账号可查看列表中')
+      this.openCustomerEdit(target)
+    },
+    openAgentRegionCustomers(item) {
+      this.openCustomerList({ province: item.province, city: item.city || 'all' })
     },
     resolveMapProvince(regionName) {
       const normalize = value => String(value || '')
@@ -1216,15 +1674,31 @@ createApp({
         const soft = styles.getPropertyValue('--soft').trim()
         const border = styles.getPropertyValue('--border').trim()
         const text = styles.getPropertyValue('--text').trim()
-        const max = Math.max(1, ...this.provinceData.map(item => item[this.mapGrade] || 0))
+        const max = Math.max(1, ...this.mapRegions.map(item => this.mapView === 'customers' ? Number(item.count || 0) : Number(item.authorizationCount || 0)))
+        const agentColors = { active: '#198f63', partial: '#79b997', expiring: '#e6a23c', expired: '#d75a5a', inactive: '#a7b1ad', none: soft }
+        const mapData = this.mapRegions.map(item => ({
+          name: item.name,
+          value: this.mapView === 'customers' ? Number(item.count || 0) : Number(item.authorizationCount || 0),
+          coverageStatus: item.coverageStatus || 'none',
+          authorizationCount: item.authorizationCount || 0,
+          exclusiveCount: item.exclusiveCount || 0,
+          grades: item.grades || {},
+          signedCount: item.signedCount || 0,
+          itemStyle: this.mapView === 'agents' ? { areaColor: agentColors[item.coverageStatus] || soft } : undefined,
+        }))
         this.mapChart.setOption({
-          tooltip: { trigger: 'item', backgroundColor: card, borderColor: border, textStyle: { color: text }, formatter: params => `${params.name}<br/><b style="font-size:18px">${params.value || 0}</b> 位客户` },
-          visualMap: { show: true, min: 0, max, left: 24, bottom: 24, text: ['高', '低'], calculable: false, textStyle: { color: text }, inRange: { color: [soft, accent] } },
-          series: [{ type: 'map', map: 'china-customers', roam: true, zoom: 1.12, scaleLimit: { min: .9, max: 4 }, label: { show: false }, itemStyle: { areaColor: soft, borderColor: card, borderWidth: 1.3 }, emphasis: { label: { show: true, color: text, fontWeight: 700 }, itemStyle: { areaColor: accent, shadowBlur: 12, shadowColor: `${accent}66` } }, data: this.provinceData.map(item => ({ name: item.name, value: item[this.mapGrade] || 0 })) }],
+          tooltip: { trigger: 'item', backgroundColor: card, borderColor: border, textStyle: { color: text }, formatter: params => {
+            const data = params.data || {}
+            if (this.mapView === 'agents') return `${params.name}<br/><b style="font-size:16px">${data.authorizationCount || 0}</b> 项授权 · ${data.exclusiveCount || 0} 项独家<br/>区域客资 ${data.value == null ? 0 : (this.mapRegions.find(item => item.name === params.name)?.count || 0)} 条`
+            return `${params.name}<br/><b style="font-size:18px">${params.value || 0}</b> 条客资<br/>A ${data.grades?.A || 0} · B ${data.grades?.B || 0} · C ${data.grades?.C || 0}<br/>签约客户 ${data.signedCount || 0}`
+          } },
+          visualMap: this.mapView === 'customers' ? { show: true, min: 0, max, left: 24, bottom: 24, text: ['高', '低'], calculable: false, textStyle: { color: text }, inRange: { color: [soft, accent] } } : { show: false },
+          series: [{ type: 'map', map: 'china-customers', roam: true, zoom: 1.12, scaleLimit: { min: .9, max: 4 }, label: { show: false }, itemStyle: { areaColor: soft, borderColor: card, borderWidth: 1.3 }, emphasis: { label: { show: true, color: text, fontWeight: 700 }, itemStyle: { shadowBlur: 12, shadowColor: `${accent}66` } }, data: mapData }],
         }, true)
         this.mapChart.off('click')
         this.mapChart.on('click', params => {
-          this.openMapProvinceCustomers(params.name)
+          const province = this.resolveMapProvince(params.name) || params.name
+          this.loadRegionalMap(province)
         })
         this.mapChart.resize()
       } catch (error) {
@@ -1233,7 +1707,80 @@ createApp({
     },
     retryMap() {
       this.chinaGeoJSON = null
-      this.renderMap()
+      this.loadRegionalMap(this.selectedMapRegion)
+    },
+    returnToSavedCustomer(customerId, options = {}) {
+      const visibleInMainList = this.customers.some(customer => customer.id === customerId && customer.grade !== 'D')
+      this.savedCustomerId = visibleInMainList ? customerId : null
+      this.customerPool = 'active'
+      if (options.preserveFilters) this.openRegionMenu = ''
+      else this.resetFilters()
+      this.switchPage('customers')
+      if (visibleInMainList) this.$nextTick(() => document.getElementById(`customer-record-${customerId}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }))
+    },
+    captureCustomerEditReturnContext() {
+      return {
+        page: this.activePage,
+        customerPool: this.customerPool,
+        keyword: this.keyword,
+        customerGrade: this.customerGrade,
+        sourceFilter: this.sourceFilter,
+        projectTypeFilter: this.projectTypeFilter,
+        progressFilter: this.progressFilter,
+        provinceFilter: this.provinceFilter,
+        cityFilter: this.cityFilter,
+        dateFrom: this.dateFrom,
+        dateTo: this.dateTo,
+        personalSearch: this.personalSearch || '',
+        personalStatus: this.personalStatus || 'active',
+        personalSort: this.personalSort || 'priority',
+        personalEmployee: this.personalEmployee || '',
+        personalFilters: { ...(this.personalFilters || {}) },
+        scrollY: typeof window === 'undefined' ? 0 : window.scrollY,
+      }
+    },
+    restoreCustomerEditReturnContext(savedCustomer, savedProject, context = this.customerEditReturnContext) {
+      const target = context || { page: 'customers', customerPool: 'active', scrollY: 0 }
+      const page = ['overview', 'customers', 'heatmap', 'followups', 'updates', 'visitors', 'plans'].includes(target.page) ? target.page : 'customers'
+      for (const key of ['keyword', 'customerGrade', 'sourceFilter', 'projectTypeFilter', 'progressFilter', 'provinceFilter', 'cityFilter', 'dateFrom', 'dateTo']) {
+        if (target[key] !== undefined) this[key] = target[key]
+      }
+      this.customerPool = target.customerPool === 'dormant' ? 'dormant' : 'active'
+      if (target.personalFilters) this.personalFilters = { ...target.personalFilters }
+      for (const key of ['personalSearch', 'personalStatus', 'personalSort', 'personalEmployee']) {
+        if (target[key] !== undefined) this[key] = target[key]
+      }
+      this.activePage = page
+      if (typeof history !== 'undefined') history.replaceState(null, '', `#/${page}`)
+      this.openRegionMenu = ''
+
+      let visible = null
+      let elementId = ''
+      this.savedCustomerId = null
+      this.savedProjectId = null
+      if (page === 'customers') {
+        const inPool = this.customerPool === 'dormant' ? savedCustomer.grade === 'D' : savedCustomer.grade !== 'D'
+        visible = inPool && this.customerMatchesCurrentFilters(savedCustomer)
+        this.savedCustomerId = visible ? savedCustomer.id : null
+        elementId = `customer-record-${savedCustomer.id}`
+      } else if (page === 'followups') {
+        const projectId = savedProject?.id || this.selectedCustomerProjectId
+        const cached = this.personalProjects?.find(project => project.id === projectId)
+        const candidate = cached ? { ...cached, ...(savedProject || {}), customer: { ...cached.customer, ...savedCustomer } } : null
+        visible = Boolean(candidate && this.personalProjectMatchesFilters?.(candidate))
+        this.savedProjectId = visible ? projectId : null
+        elementId = `personal-project-${projectId}`
+      }
+
+      this.$nextTick(() => {
+        const element = visible && elementId ? document.getElementById(elementId) : null
+        if (element) element.scrollIntoView({ block: 'start', behavior: 'smooth' })
+        else if (typeof window !== 'undefined' && Number.isFinite(target.scrollY)) window.scrollTo({ top: target.scrollY })
+        if (page === 'heatmap') this.loadRegionalMap()
+        if (page === 'overview') this.loadOverviewStatistics()
+      })
+      this.customerEditReturnContext = null
+      return visible
     },
     resetFilters(clearKeyword = true) {
       this.customerGrade = 'all'
@@ -1327,6 +1874,47 @@ createApp({
         this.employeeLoadError = error.message || '员工账号加载失败'
       }
     },
+    isValidCustomerPhone(value) {
+      const contact = String(value || '').trim()
+      return contact.length > 0 && contact.length <= 100
+    },
+    async loadOverviewStatistics() {
+      if (this.overviewLoading) return
+      this.overviewLoading = true
+      this.overviewError = ''
+      try {
+        const response = await fetch('/api/statistics/overview/')
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || `经营总览加载失败（${response.status}）`)
+        if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('经营总览数据格式不正确')
+        this.overviewStats = data
+        const customerStats = data.customers && typeof data.customers === 'object' ? data.customers : {}
+        const rawGradeCounts = customerStats.gradeCounts
+        const gradeCounts = rawGradeCounts && typeof rawGradeCounts === 'object' && !Array.isArray(rawGradeCounts) ? rawGradeCounts : { A: 0, B: 0, C: 0 }
+        const projectStats = data.projects && typeof data.projects === 'object' ? data.projects : {}
+        const progressUpdateStats = data.progressUpdates && typeof data.progressUpdates === 'object' ? data.progressUpdates : {}
+        this.metrics[0].value = String(customerStats.total || 0)
+        this.metrics[0].change = `A ${gradeCounts.A || 0} · B ${gradeCounts.B || 0} · C ${gradeCounts.C || 0}`
+        this.metrics[0].note = `A / B / C 类可见客资共 ${customerStats.total || 0} 条`
+        this.metrics[1].value = String(progressUpdateStats.last7Days || 0)
+        this.metrics[1].change = '近 7 天'
+        this.metrics[1].note = progressUpdateStats.last7Days
+          ? `近 7 天共有 ${progressUpdateStats.last7Days} 条实际项目进展`
+          : '近 7 天暂无项目进展记录'
+        const activeProjects = Number(projectStats.active || 0)
+        const implementationProjects = Number(projectStats.implementation || 0)
+        this.metrics[2].value = String(implementationProjects)
+        this.metrics[2].change = activeProjects
+          ? `占在办 ${Math.round(implementationProjects / activeProjects * 100)}%`
+          : '占在办 0%'
+        this.metrics[2].note = `项目共 ${projectStats.total || 0} 个 · 在办 ${activeProjects} 个 · 已完成 ${projectStats.completed || 0} 个`
+      } catch (error) {
+        this.overviewError = error.message || '经营总览加载失败'
+        this.showToast(this.overviewError)
+      } finally {
+        this.overviewLoading = false
+      }
+    },
     async loadCustomers() {
       try {
         const response = await fetch('/api/customers/')
@@ -1338,6 +1926,11 @@ createApp({
         this.provinceData = this.buildProvinceData(this.customers)
         this.syncSummaryData()
         this.customerLoadError = ''
+        if (!this.customerDeepLinkHandled) {
+          this.customerDeepLinkHandled = true
+          await nextTick()
+          this.openCustomerProjectFromHash()
+        }
       } catch (error) {
         this.customerLoadError = error.message || '客资数据加载失败'
         this.showToast(this.customerLoadError)
@@ -1364,9 +1957,6 @@ createApp({
         this.readProgressUpdates = Array.isArray(data.readUpdates) ? data.readUpdates : []
         this.periodProgressUpdates = Array.isArray(data.periodUpdates) ? data.periodUpdates : this.progressUpdates
         this.progressUpdateUnreadCount = Number(data.unreadCount || 0)
-        this.metrics[1].value = String(data.total || 0)
-        this.metrics[1].change = this.progressUpdateUnreadCount ? `新 ${this.progressUpdateUnreadCount} 条` : '近 7 天'
-        this.metrics[1].note = data.total ? `近一周共有 ${data.total} 条项目进展` : '近一周暂无项目进展'
       } catch (error) {
         this.showToast(error.message || '进度更新加载失败')
       } finally {
@@ -1382,7 +1972,6 @@ createApp({
           headers: { 'X-CSRFToken': this.csrfToken() },
         })
         this.progressUpdateUnreadCount = 0
-        this.metrics[1].change = '近 7 天'
       }
     },
     closeProgressUpdates() {
@@ -1553,8 +2142,25 @@ createApp({
         this.visitorSaving = false
       }
     },
+    requestActionConfirm({ title, message, confirmLabel = '确认', tone = 'danger' }) {
+      if (this.actionConfirmResolver) this.actionConfirmResolver(false)
+      this.actionConfirm = { open: true, title, message, confirmLabel, tone }
+      return new Promise(resolve => { this.actionConfirmResolver = resolve })
+    },
+    resolveActionConfirm(confirmed) {
+      const resolver = this.actionConfirmResolver
+      this.actionConfirmResolver = null
+      this.actionConfirm = { open: false, title: '', message: '', confirmLabel: '确认', tone: 'danger' }
+      if (resolver) resolver(Boolean(confirmed))
+    },
     async deleteVisitorRecord(record) {
-      if (!record?.id || !window.confirm(`确定删除 ${record.customer.name} 的这条来访记录吗？`)) return
+      if (!record?.id) return
+      const confirmed = await this.requestActionConfirm({
+        title: '删除来访记录？',
+        message: `将删除 ${record.customer.name} 的这条来访记录，此操作无法撤销。`,
+        confirmLabel: '确认删除',
+      })
+      if (!confirmed) return
       try {
         const response = await fetch(`/api/visitors/${record.id}/`, {
           method: 'DELETE',
@@ -1647,8 +2253,18 @@ createApp({
     },
     openProgressUpdateCreate(interval = null) {
       const customer = this.customers[this.editingIndex]
-      if (!customer || !['A', 'B'].includes(customer.grade)) return
-      const currentIndex = Math.max(0, Math.min(this.progressStages.indexOf(customer.progress), this.progressStages.length - 2))
+      if (!customer) return
+      const selectedProject = this.customerDetailProjects.find(item => item.id === this.selectedCustomerProjectId)
+      if (!selectedProject) {
+        this.showToast('请先填写项目名称和项目地区并保存，再添加进展记录')
+        this.$nextTick(() => {
+          this.$refs.editProjectNameInput?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+          this.$refs.editProjectNameInput?.focus()
+        })
+        return
+      }
+      const currentProgress = selectedProject?.progress || customer.progress
+      const currentIndex = Math.max(0, Math.min(this.progressStages.indexOf(currentProgress), this.progressStages.length - 2))
       const targetInterval = interval || this.customerProgressIntervals[currentIndex]
       if (!targetInterval) return
       this.editingProgressUpdateId = null
@@ -1681,7 +2297,8 @@ createApp({
     async saveProgressUpdate() {
       const content = this.progressUpdateForm.content.trim()
       const customer = this.customers[this.editingIndex]
-      const project = this.customerProjects.find(item => item.customer?.id === customer?.id)
+      const project = this.customerDetailProjects.find(item => item.id === this.selectedCustomerProjectId)
+        || this.customerProjects.find(item => item.customer?.id === customer?.id)
       if (!this.progressUpdateForm.occurredAt) return this.showToast('请选择记录时间')
       if (!content) return this.showToast('请填写跟进内容')
       if (!project) return this.showToast('未找到该客户的关联项目')
@@ -1708,7 +2325,7 @@ createApp({
         this.expandedProgressUpdateId = data.update.id
         this.progressUpdateForm = { occurredAt: '', content: '', fromProgress: '', toProgress: '' }
         await this.loadProgressUpdates()
-        if (customer?.id) await this.loadCustomerFollowUps(customer.id)
+        if (customer?.id) await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId, { preserveEditSnapshot: true, preserveStageExpansion: true })
         this.showToast(isEditing ? '进展记录已修改' : '进展记录已添加，项目正式阶段保持不变')
       } catch (error) {
         this.showToast(error.message || '进度更新保存失败')
@@ -1718,7 +2335,12 @@ createApp({
     },
     async deleteProgressUpdate(item) {
       if (!item?.id || !item.canDelete) return
-      if (!window.confirm(`确定删除这条进展记录吗？\n\n${item.createdLabel} · ${item.intervalLabel}\n${item.content}`)) return
+      const confirmed = await this.requestActionConfirm({
+        title: '删除这条小进展？',
+        message: `${item.createdLabel} · ${item.intervalLabel}\n${item.content}`,
+        confirmLabel: '确认删除',
+      })
+      if (!confirmed) return
       try {
         const response = await fetch(`/api/progress-updates/${item.id}/`, {
           method: 'DELETE',
@@ -1895,7 +2517,7 @@ createApp({
         this.showFollowTaskEdit = false
         this.editingFollowTask = null
         this.followTaskEditForm = { title: '', role: 'business', dueAt: '', result: '' }
-        if (customerId) await this.loadCustomerFollowUps(customerId)
+        if (customerId) await this.loadCustomerFollowUps(customerId, this.selectedCustomerProjectId, { preserveEditSnapshot: true, preserveStageExpansion: true })
         await this.loadFollowUpTasks()
         this.showToast('阶段事项已更新，项目进度保持不变')
       } catch (error) {
@@ -1927,7 +2549,7 @@ createApp({
         if (!response.ok) throw new Error(data.error || `阶段事项删除失败（${response.status}）`)
         this.showFollowTaskDelete = false
         this.deletingFollowTask = null
-        if (customerId) await this.loadCustomerFollowUps(customerId)
+        if (customerId) await this.loadCustomerFollowUps(customerId, this.selectedCustomerProjectId, { preserveEditSnapshot: true, preserveStageExpansion: true })
         await this.loadFollowUpTasks()
         this.showToast('阶段事项已删除，项目进度保持不变')
       } catch (error) {
@@ -1983,7 +2605,7 @@ createApp({
         this.showManualTaskCreate = false
         this.activeManualProject = null
         this.manualTaskForm = { title: '', role: 'business', dueAt: '' }
-        if (customerId) await this.loadCustomerFollowUps(customerId)
+        if (customerId) await this.loadCustomerFollowUps(customerId, this.selectedCustomerProjectId, { preserveEditSnapshot: true, preserveStageExpansion: true })
         await this.loadFollowUpTasks()
         this.showToast('阶段事项已新增，完成后不会改变项目进度')
       } catch (error) {
@@ -2061,7 +2683,7 @@ createApp({
         await this.loadCustomers()
         this.showToast(
           status === 'completed'
-            ? (task.isManual ? '阶段事项已完成，项目进度保持不变' : '任务已完成，项目已进入下一进度')
+            ? '事项已完成，项目阶段保持不变'
             : '任务状态已更新',
         )
       } catch (error) {
@@ -2088,12 +2710,7 @@ createApp({
       return `${this.formatLocalDate(date)}T${hours}:${minutes}`
     },
     syncTomorrowBadge() {
-      const followUpNav = this.navItems.find(item => item.id === 'followups')
-      const tomorrowNav = this.navItems.find(item => item.id === 'plans')
-      const activeFollowUps = this.followUpTasks.filter(task => task.status !== 'completed').length
-      const tomorrowTotal = this.systemTomorrowSuggestions.length + this.unfinishedTomorrowItems
-      if (followUpNav) followUpNav.badge = activeFollowUps ? String(activeFollowUps) : ''
-      if (tomorrowNav) tomorrowNav.badge = tomorrowTotal ? String(tomorrowTotal) : ''
+      this.syncPersonalBadges?.()
     },
     async loadTomorrowItems() {
       if (this.tomorrowLoading) return
@@ -2260,7 +2877,7 @@ createApp({
       this.showSchemeCalculator = true
       this.schemeLoading = true
       try {
-        const response = await fetch(`/api/customers/${customer.id}/scheme-calculation/`)
+        const response = await fetch(`/api/customers/${customer.id}/scheme-calculation/?projectId=${encodeURIComponent(this.selectedCustomerProjectId || '')}`)
         const data = await response.json()
         if (!response.ok) throw new Error(data.error || `测算数据读取失败（${response.status}）`)
         this.schemeCalculation = this.normalizeSchemeCalculation(data.calculation, customer)
@@ -2292,26 +2909,47 @@ createApp({
       this.schemeCalculation.remarksLines.splice(index, 1)
     },
     schemeLayerPreview(layer) {
-      const length = Number(layer?.length) || 0
-      const width = Number(layer?.width) || 0
-      const thickness = Number(layer?.thickness) || 0
-      const dosage = (Number(layer?.dosagePercent) || 0) / 100
-      const density = Number(layer?.density) || 0
-      const unitPrice = Number(layer?.unitPrice) || 0
-      const exactQuantity = length * width * thickness * dosage * density
-      const quantity = exactQuantity > 0 ? Math.ceil(exactQuantity - Number.EPSILON) : 0
+      const [n, d] = this.schemeLayerFraction(layer)
+      const [price, scale] = this.schemeDecimal(layer?.unitPrice)
+      const [squareN, squareD] = this.schemeLayerFraction({...layer, length: 1, width: 1})
+      const money = (a, b) => Number((2n * a * 100n + b) / (2n * b)) / 100
+      const exactQuantity = Number(n) / Number(d)
       return {
         exactQuantity,
-        quantity,
-          squareMeterPrice: thickness * dosage * density * unitPrice,
-        totalPrice: quantity * unitPrice,
+        quantity: exactQuantity,
+        squareMeterPrice: money(squareN * price, squareD * scale),
+        totalPrice: money(n * price, d * scale),
       }
     },
     schemeMoney(value) {
       return `¥${Number(value || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
     },
     schemeTotalPrice() {
-      return this.schemeCalculation.layers.reduce((sum, layer) => sum + this.schemeLayerPreview(layer).totalPrice, 0)
+      return this.schemeCalculation.layers.slice(0, this.schemeCalculation.layerCount).reduce((sum, layer) => sum + Math.round(this.schemeLayerPreview(layer).totalPrice * 100), 0) / 100
+    },
+    schemeDecimal(value) {
+        const n = Number(value) || 0
+        if (!Number.isFinite(n) || n < 0) return [0n, 1n]
+        const [mantissa, exponent = '0'] = String(n).toLowerCase().split('e')
+        const places = (mantissa.split('.')[1] || '').length - Number(exponent)
+        const digits = BigInt(mantissa.replace('.', ''))
+        return places < 0 ? [digits * 10n ** BigInt(-places), 1n] : [digits, 10n ** BigInt(places)]
+    },
+    schemeLayerFraction(layer) {
+      let n = 1n, d = 100n
+      for (const key of ['length', 'width', 'thickness', 'dosagePercent', 'density']) {
+        const [a, b] = this.schemeDecimal(layer?.[key]); n *= a; d *= b
+      }
+      return [n, d]
+    },
+    schemeQuantityTotals() {
+      // Decimal integer arithmetic avoids rounding 2.0000000000000004 up to 3.
+      let numerator = 0n, denominator = 1n
+      for (const layer of this.schemeCalculation.layers.slice(0, this.schemeCalculation.layerCount)) {
+        const [n, d] = this.schemeLayerFraction(layer)
+        numerator = numerator * d + n * denominator; denominator *= d
+      }
+      return { exactQuantity: Number(numerator) / Number(denominator), quantity: Number((numerator + denominator - 1n) / denominator) }
     },
     schemePayload() {
       return {
@@ -2354,7 +2992,7 @@ createApp({
       }
       this.schemeSaving = true
       try {
-        const response = await fetch(`/api/customers/${customer.id}/scheme-calculation/`, {
+        const response = await fetch(`/api/customers/${customer.id}/scheme-calculation/?projectId=${encodeURIComponent(this.selectedCustomerProjectId || '')}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
           body: JSON.stringify(payload),
@@ -2363,7 +3001,7 @@ createApp({
         if (!response.ok) throw new Error(data.error || `测算保存失败（${response.status}）`)
         this.schemeCalculation = this.normalizeSchemeCalculation(data.calculation, customer)
         this.customerSchemeCalculation = data.calculation
-        if (!silent) this.showToast('方案测算已保存，用量已按整吨向上取整')
+        if (!silent) this.showToast('方案测算已保存，项目总用量合计后向上取整')
         return true
       } catch (error) {
         this.showToast(`保存失败：${error.message || '请稍后重试'}`)
@@ -2380,7 +3018,7 @@ createApp({
       if (!saved) return
       this.schemeExporting = true
       try {
-        const response = await fetch(`/api/customers/${customer.id}/scheme-calculation/export/`, {
+        const response = await fetch(`/api/customers/${customer.id}/scheme-calculation/export/?projectId=${encodeURIComponent(this.selectedCustomerProjectId || '')}`, {
           method: 'POST',
           headers: { 'X-CSRFToken': this.csrfToken() },
         })
@@ -2523,13 +3161,16 @@ createApp({
       }
       return stage.tasks
     },
+    stageItemCount(stage) {
+      return this.stageTasksForDisplay(stage).length
+    },
     stageSummaryLabel(stage) {
       if (!stage) return '点击查看'
       if (stage.name === '技术验证' && this.customerMaterialExperiment?.id) return '实验已登记'
       if (stage.name === '客户深度沟通' && this.customerVisitorRecords.length) return `${this.customerVisitorRecords.length} 次来访`
       if (stage.name === '方案与报价' && this.customerSchemeCalculation?.id) return `${this.customerSchemeCalculation.layerCount || 1} 层测算`
-      const tasks = this.stageTasksForDisplay(stage)
-      return tasks.length ? `${tasks.length} 条事项` : '点击查看'
+      const count = this.stageItemCount(stage)
+      return count ? `${count} 条事项` : '点击查看'
     },
     toggleProgressInterval(interval) {
       this.expandedProgressIntervalKey = this.expandedProgressIntervalKey === interval.key ? '' : interval.key
@@ -2562,7 +3203,7 @@ createApp({
       if (!Object.values(payload).some(Boolean)) return this.showToast('请至少填写一项实验情况')
       this.materialExperimentSaving = true
       try {
-        const response = await fetch(`/api/customers/${customer.id}/material-experiment/`, {
+        const response = await fetch(`/api/customers/${customer.id}/material-experiment/?projectId=${encodeURIComponent(this.selectedCustomerProjectId || '')}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
           body: JSON.stringify(payload),
@@ -2594,6 +3235,7 @@ createApp({
       this.openRegionMenu = ''
     },
     locationParts(customer) {
+      if (customer.country) return { province: customer.country, city: customer.city || '待完善', district: customer.district || '—' }
       const regionParts = String(customer.region || '').split(/[·\s/]+/).map(item => item.trim()).filter(Boolean)
       const rawProvince = String(customer.province || regionParts[0] || '待完善')
       const rawCity = String(customer.city || regionParts[1] || '待完善')
@@ -2614,6 +3256,9 @@ createApp({
     customerDescription(customer) {
       if (String(customer.description || '').trim()) return customer.description
       return '暂无详细客户描述，请补充客户需求、项目情况、现场条件、施工面积、预计用量、进场时间及每次沟通结果。'
+    },
+    wechatStatusLabel(value) {
+      return ({ yes: '已添加', no: '未添加', rejected: '已添加未通过', unknown: '未添加' })[value] || '未添加'
     },
     stagePercent(progress) {
       const index = this.progressStages.indexOf(progress)
@@ -2638,12 +3283,15 @@ createApp({
         return {
           客资来源: customer.source || '',
           客户等级: customer.grade || '',
-          省: location.province,
+          国家地区: customer.country || '',
+          省: customer.country ? '' : location.province,
           市: location.city,
           区: location.district,
           客户名称: customer.name || '',
-          客户电话: customer.phone || '',
+          联系方式: customer.phone || '',
+          是否添加微信: ({ yes: '已添加', no: '未添加', rejected: '已添加未通过', unknown: '未添加' })[customer.wechatStatus || 'no'],
           客户描述: this.customerDescription(customer),
+          项目名称: customer.projectName || '',
           项目进度: customer.progress || '',
           施工方案: customer.plan || '',
           商务负责人: customer.owner || '',
@@ -2659,7 +3307,7 @@ createApp({
       const worksheet = XLSX.utils.json_to_sheet(records)
       worksheet['!cols'] = [
         { wch: 12 }, { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 14 }, { wch: 22 },
-        { wch: 18 }, { wch: 62 }, { wch: 16 }, { wch: 42 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
+        { wch: 18 }, { wch: 62 }, { wch: 28 }, { wch: 16 }, { wch: 42 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
       ]
       const workbook = XLSX.utils.book_new()
       XLSX.utils.book_append_sheet(workbook, worksheet, '客资信息')
@@ -2675,19 +3323,22 @@ createApp({
         const worksheet = workbook.Sheets[workbook.SheetNames[0]]
         const rows = XLSX.utils.sheet_to_json(worksheet, { defval: '', raw: false })
         if (!rows.length) throw new Error('表格中没有可导入的数据')
-        const requiredHeaders = ['客资来源', '客户等级', '省', '市', '区', '客户名称', '客户电话', '客户描述', '项目进度', '施工方案', '商务负责人', '技术负责人']
+        const requiredHeaders = ['客资来源', '客户等级', '省', '市', '区', '客户名称', '客户电话', '客户描述', '项目名称', '项目进度', '施工方案', '商务负责人', '技术负责人']
         const missingHeaders = requiredHeaders.filter(header => !Object.prototype.hasOwnProperty.call(rows[0], header))
         if (missingHeaders.length) throw new Error(`缺少列：${missingHeaders.join('、')}`)
         const imported = rows.filter(row => String(row['客户名称'] || '').trim()).map((row, index) => {
-          const grade = String(row['客户等级'] || 'D').trim().toUpperCase()
-          const source = String(row['客资来源'] || '其他').trim()
+          const grade = String(row['客户等级'] || 'C').trim().toUpperCase()
+          const source = String(row['客资来源'] || '').trim()
+          if (!CUSTOMER_SOURCES.includes(source)) throw new Error(`第 ${index + 2} 行客资来源必须是：${CUSTOMER_SOURCES.join('、')}`)
           const province = String(row['省'] || '').trim()
           const city = String(row['市'] || '').trim()
           const progress = String(row['项目进度'] || '需求对接').trim()
           const referrer = source === '朋友介绍' ? String(row['介绍人'] || '').trim() : ''
           return {
             name: String(row['客户名称']).trim(),
-            phone: String(row['客户电话'] || '').trim(),
+            phone: String(row['客户电话'] || row['联系方式'] || '').trim(),
+            country: String(row['国家地区'] || '').trim(),
+            wechatStatus: ({ '已添加': 'yes', '是': 'yes', '未添加': 'no', '否': 'no', '已添加未通过': 'rejected' })[String(row['是否添加微信'] || '').trim()] || 'no',
             source,
             channel: referrer ? `介绍人：${referrer}` : 'Excel导入',
             referrer,
@@ -2695,8 +3346,9 @@ createApp({
             city,
             district: String(row['区'] || '').trim(),
             region: [province, city].filter(Boolean).join(' · ') || '地区待完善',
-            grade: ['A', 'B', 'C', 'D'].includes(grade) ? grade : 'D',
+            grade: ['A', 'B', 'C', 'D'].includes(grade) ? grade : 'C',
             description: String(row['客户描述'] || '').trim(),
+            projectName: String(row['项目名称'] || '').trim(),
             progress,
             plan: String(row['施工方案'] || '').trim() || '方案待完善',
             percent: this.stagePercent(progress),
@@ -2736,7 +3388,7 @@ createApp({
       const grouped = new Map()
       customers.forEach(customer => {
         if (customer.grade === 'D') return
-        const province = this.locationParts(customer).province
+        const province = customer.country ? '' : this.locationParts(customer).province
         if (!province || province.includes('待完善')) return
         if (!grouped.has(province)) grouped.set(province, { name: province, all: 0, A: 0, B: 0, C: 0 })
         const item = grouped.get(province)
@@ -2746,26 +3398,20 @@ createApp({
       return [...grouped.values()].sort((a, b) => b.all - a.all)
     },
     syncSummaryData() {
-      const total = this.reportingCustomers.length
-      const gradeCounts = Object.fromEntries(['A', 'B', 'C'].map(grade => [grade, this.reportingCustomers.filter(customer => customer.grade === grade).length]))
-      const reportingProjects = this.customerProjects.filter(project => project.customer?.grade !== 'D')
-      const constructionProjects = reportingProjects.filter(project => this.isConstructionProgress(project.progress)).length
-      const projectTotal = reportingProjects.length
+      const total = this.customers.filter(customer => customer.grade !== 'D').length
       const customerNav = this.navItems.find(item => item.id === 'customers')
       if (customerNav) customerNav.badge = String(total)
-      this.metrics[0].value = String(total)
-      this.metrics[0].change = `A ${gradeCounts.A} · B ${gradeCounts.B} · C ${gradeCounts.C}`
-      this.metrics[0].note = `A / B / C 类有效客资共 ${total} 条`
-      this.metrics[2].value = String(constructionProjects)
-      this.metrics[2].change = projectTotal ? `占 ${Math.round(constructionProjects / projectTotal * 100)}%` : '占 0%'
-      this.metrics[2].note = `${projectTotal} 个项目中 ${constructionProjects} 个当前处于施工阶段`
     },
-    async loadCustomerFollowUps(customerId) {
+    async loadCustomerFollowUps(customerId, projectId = this.selectedCustomerProjectId, options = {}) {
       if (!customerId) return
+      const preserveEditSnapshot = Boolean(options.preserveEditSnapshot)
+      const preserveStageExpansion = Boolean(options.preserveStageExpansion)
+      const openingDraft = JSON.stringify(this.editCustomer)
       this.customerFollowUpsLoading = true
       this.customerFollowUpsError = ''
       try {
-        const response = await fetch(`/api/customers/${customerId}/`)
+        const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''
+        const response = await fetch(`/api/customers/${customerId}/${query}`)
         const data = await response.json()
         if (!response.ok) throw new Error(data.error || `阶段事项加载失败（${response.status}）`)
         const activeCustomer = this.customers[this.editingIndex]
@@ -2776,16 +3422,53 @@ createApp({
         this.customerSchemeCalculation = data.schemeCalculation || null
         this.customerMaterialExperiment = data.materialExperiment || null
         this.customerCanManageProject = Boolean(data.canManageProject)
+        this.customerCanManageCommercial = Boolean(data.canManageCommercial)
+        this.customerDetailProjects = Array.isArray(data.projects) ? data.projects : []
+        this.customerAssociatedProjects = Array.isArray(data.associatedProjects) ? data.associatedProjects : []
+        this.selectedCustomerProjectId = data.selectedProjectId || this.customerDetailProjects[0]?.id || null
+        this.customerPartnerships = Array.isArray(data.partnerships) ? data.partnerships : []
+        this.customerAuthorizations = Array.isArray(data.authorizations) ? data.authorizations : []
+        this.customerContracts = Array.isArray(data.contracts) ? data.contracts : []
+        this.customerAttachments = Array.isArray(data.attachments) ? data.attachments : []
+        this.customerRelationshipExpanded = this.activeCustomerPartnerships.length > 0
+        this.syncInlineRelationshipForms()
+        const selectedProject = this.customerDetailProjects.find(item => item.id === this.selectedCustomerProjectId)
+        const draftUnchanged = JSON.stringify(this.editCustomer) === openingDraft
+        if (selectedProject && !preserveEditSnapshot) {
+          const initial = JSON.parse(openingDraft)
+          const projectValues = {
+            ownerId: selectedProject.businessOwner?.id || '', owner: selectedProject.businessOwner?.name || '待分配',
+            techId: selectedProject.technicalOwner?.id || '', tech: selectedProject.technicalOwner?.name || '待分配',
+            projectName: selectedProject.name || '', country: selectedProject.country || '',
+            locationMode: selectedProject.country ? 'overseas' : 'domestic',
+            province: selectedProject.province || '', city: selectedProject.city || '', district: selectedProject.district || '',
+            progress: selectedProject.progress, plan: selectedProject.plan || '', projectTypeId: selectedProject.projectType?.id || '',
+          }
+          // Merge each untouched field; a slow response must not undo user input.
+          for (const [key, value] of Object.entries(projectValues)) {
+            if (this.editCustomer[key] === initial[key]) this.editCustomer[key] = value
+          }
+          if (!preserveStageExpansion) {
+            const selectedStage = this.customerProgressRoadmap.find(stage => stage.name === selectedProject.progress)
+            this.expandedCustomerProgressStage = selectedStage && this.stageItemCount(selectedStage) ? selectedProject.progress : ''
+          }
+        }
+        if (!preserveEditSnapshot && draftUnchanged) this.editSnapshot = JSON.stringify(this.editCustomer)
       } catch (error) {
         this.customerFollowUpsError = error.message || '阶段事项加载失败'
       } finally {
         this.customerFollowUpsLoading = false
       }
     },
+    setCustomerLocationMode(target, mode) {
+      Object.assign(this[target], { locationMode: mode, country: '', province: '', city: '', district: '' })
+      this.openRegionMenu = ''
+      this.newRegionSearch = { province: '', city: '', district: '' }
+    },
     emptyNewCustomer() {
       return {
-        name: '', phone: '', source: '抖音', referrer: '',
-        province: '', city: '', district: '', grade: 'B', projectTypeId: '', progress: '需求对接',
+        name: '', phone: '', wechatStatus: 'no', source: '抖音', referrer: '',
+        country: '', locationMode: 'domestic', province: '', city: '', district: '', grade: 'C', cooperationStatus: 'none', projectName: '', projectTypeId: '', progress: '需求对接',
         ownerId: '', owner: '', techId: '', tech: '', plan: '', description: '',
       }
     },
@@ -2819,20 +3502,21 @@ createApp({
     discardCreateCustomer() {
       this.closeCreateCustomer()
     },
-    openCustomerEdit(customer) {
-      const index = this.customers.indexOf(customer)
-      if (index < 0) return
+    editCustomerFromRecord(customer) {
       const location = this.locationParts(customer)
-      this.editingIndex = index
-      this.editCustomer = {
+      return {
         name: customer.name || '',
         phone: customer.phone || '',
+        wechatStatus: customer.wechatStatus === 'unknown' ? 'no' : (customer.wechatStatus || 'no'),
         source: customer.source || '抖音',
         referrer: customer.referrer || '',
-        province: location.province.includes('待完善') ? '' : location.province,
+        country: customer.country || '', locationMode: customer.country ? 'overseas' : 'domestic',
+        province: customer.country ? '' : (location.province.includes('待完善') ? '' : location.province),
         city: location.city.includes('待完善') ? '' : location.city,
-        district: location.district.includes('待完善') ? '' : location.district,
+        district: customer.district || '',
         grade: customer.grade || 'D',
+        cooperationStatus: customer.cooperationStatus || ((customer.identities || []).length ? 'cooperating' : 'none'),
+        projectName: customer.projectName || '',
         projectTypeId: customer.projectTypeId || '',
         progress: customer.progress || '需求对接',
         ownerId: this.employees.business.some(employee => employee.id === customer.ownerId) ? customer.ownerId : '',
@@ -2842,6 +3526,143 @@ createApp({
         plan: customer.plan === '方案待完善' ? '' : (customer.plan || ''),
         description: customer.description || '',
       }
+    },
+    emptyBatchCustomerRow() {
+      this.batchCustomerRowSequence += 1
+      return { localId: this.batchCustomerRowSequence, name: '', phone: '', description: '', source: '抖音' }
+    },
+    batchCustomerRowHasContent(row) {
+      return Boolean(String(row?.name || '').trim() || String(row?.phone || '').trim() || String(row?.description || '').trim())
+    },
+    openBatchCustomerCreate() {
+      this.batchCustomerRows = Array.from({ length: 10 }, () => this.emptyBatchCustomerRow())
+      this.batchCustomerRowErrors = {}
+      this.showBatchCustomerCreate = true
+    },
+    addBatchCustomerRow() {
+      this.batchCustomerRows.push(this.emptyBatchCustomerRow())
+      this.$nextTick(() => {
+        const rows = document.querySelector('.batch-customer-table')
+        rows?.lastElementChild?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+      })
+    },
+    formatCustomerCreatedAt(customer) {
+      const value = customer?.createdAt
+      const date = value ? new Date(value) : null
+      if (!date || Number.isNaN(date.getTime())) return customer?.createdDate ? chineseDate(customer.createdDate) : '时间待记录'
+      return new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+      }).format(date)
+    },
+    clearBatchCustomerRowError(localId) {
+      if (!this.batchCustomerRowErrors[localId]) return
+      const nextErrors = { ...this.batchCustomerRowErrors }
+      delete nextErrors[localId]
+      this.batchCustomerRowErrors = nextErrors
+    },
+    closeBatchCustomerCreate() {
+      this.showBatchCustomerCreate = false
+      this.batchCustomerRows = []
+      this.batchCustomerRowErrors = {}
+    },
+    async requestCloseBatchCustomerCreate() {
+      if (this.batchCustomerSaving) return
+      if (this.batchCustomerFilledCount) {
+        const confirmed = await this.requestActionConfirm({
+          title: '放弃本次批量录入？',
+          message: `当前已填写 ${this.batchCustomerFilledCount} 条客资，关闭后本次内容不会保留。`,
+          confirmLabel: '放弃录入',
+          tone: 'warning',
+        })
+        if (!confirmed) return
+      }
+      this.closeBatchCustomerCreate()
+    },
+    async submitBatchCustomers() {
+      if (this.batchCustomerSaving) return
+      const filledRows = this.batchCustomerRows
+        .map((row, index) => ({ row, index }))
+        .filter(item => this.batchCustomerRowHasContent(item.row))
+      if (!filledRows.length) {
+        this.showToast('请至少填写一条客资')
+        return
+      }
+      const errors = {}
+      filledRows.forEach(({ row }) => {
+        if (!String(row.name || '').trim()) errors[row.localId] = '请填写客户名称'
+        else if (!this.isValidCustomerPhone(row.phone)) errors[row.localId] = '请填写联系方式（最多100个字符）'
+      })
+      this.batchCustomerRowErrors = errors
+      if (Object.keys(errors).length) {
+        const firstInvalidIndex = this.batchCustomerRows.findIndex(row => errors[row.localId])
+        const firstInvalidRow = this.batchCustomerRows[firstInvalidIndex]
+        const missingName = !String(firstInvalidRow?.name || '').trim()
+        this.showToast(`第 ${firstInvalidIndex + 1} 行：${errors[firstInvalidRow.localId]}`)
+        this.$nextTick(() => {
+          const input = missingName
+            ? this.$refs.batchCustomerNameInputs?.[firstInvalidIndex]
+            : this.$refs.batchCustomerPhoneInputs?.[firstInvalidIndex]
+          input?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+          input?.focus()
+        })
+        return
+      }
+      this.batchCustomerSaving = true
+      try {
+        const customers = filledRows.map(({ row }) => ({
+          name: String(row.name || '').trim(),
+          phone: String(row.phone || '').trim(),
+          description: String(row.description || '').trim(),
+          source: String(row.source || '').trim() || '抖音',
+        }))
+        if (this.confirmCustomerDuplicates && !(await this.confirmCustomerDuplicates(customers))) return
+        const response = await fetch('/api/customers/import/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+          body: JSON.stringify({ mode: 'leads', customers }),
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || `批量增加失败（${response.status}）`)
+        await this.loadCustomers()
+        this.customerPool = 'active'
+        this.resetFilters()
+        this.switchPage('customers')
+        this.closeBatchCustomerCreate()
+        this.showToast(`已新增 ${data.createdCount || customers.length} 条客资，可在列表中逐步完善资料`)
+      } catch (error) {
+        this.showToast(`批量增加失败：${error.message || '请稍后重试'}`)
+      } finally {
+        this.batchCustomerSaving = false
+      }
+    },
+    syncInlineRelationshipForms() {
+      const level = this.inlineAgentLevel
+      const activeAuthorization = this.customerAuthorizations.find(item => (
+        item.level === level && !['terminated', 'expired'].includes(item.agreementStatus)
+      )) || this.customerAuthorizations.find(item => !['terminated', 'expired'].includes(item.agreementStatus)) || null
+      const nextYear = new Date()
+      nextYear.setFullYear(nextYear.getFullYear() + 1)
+      this.inlineAuthorizationId = activeAuthorization?.id || null
+      this.inlineAuthorizationForm = {
+        level,
+        province: activeAuthorization?.province || this.editCustomer.province || '',
+        city: level === 'province' ? '' : (activeAuthorization?.city || this.editCustomer.city || ''),
+        district: level === 'district' ? (activeAuthorization?.district || this.editCustomer.district || '') : '',
+        effectiveDate: activeAuthorization?.effectiveDate || this.todayDateValue,
+        expiryDate: activeAuthorization?.expiryDate || this.formatLocalDate(nextYear),
+      }
+      const activeContract = this.customerContracts.find(item => item.status !== 'terminated') || this.customerContracts[0] || null
+      this.inlineContractId = activeContract?.id || null
+      this.inlineContractNumber = activeContract?.contractNumber || ''
+      this.inlinePartnershipType = ''
+    },
+    openCustomerEdit(customer, requestedProjectId = null) {
+      const index = this.customers.indexOf(customer)
+      if (index < 0) return
+      if (!this.showEdit) this.customerEditReturnContext = this.captureCustomerEditReturnContext()
+      this.editingIndex = index
+      this.editCustomer = this.editCustomerFromRecord(customer)
       this.editSnapshot = JSON.stringify(this.editCustomer)
       this.customerFollowUps = []
       this.customerProgressUpdates = []
@@ -2849,14 +3670,558 @@ createApp({
       this.customerSchemeCalculation = null
       this.customerMaterialExperiment = null
       this.customerCanManageProject = false
+      this.customerCanManageCommercial = false
+      this.customerDetailProjects = this.customerProjects.filter(project => project.customer?.id === customer.id)
+      this.customerAssociatedProjects = []
+      this.customerProjectsExpanded = false
+      const exactProject = this.customerDetailProjects.find(project => project.id === Number(requestedProjectId))
+      this.selectedCustomerProjectId = exactProject?.id || this.customerDetailProjects[0]?.id || null
+      this.customerPartnerships = Array.isArray(customer.identities) ? customer.identities.map(item => ({ ...item, isActive: true })) : []
+      this.customerAuthorizations = []
+      this.customerContracts = []
+      this.customerAttachments = []
+      this.customerRelationshipExpanded = this.activeCustomerPartnerships.length > 0
+      this.inlinePartnershipType = ''
+      this.inlineAuthorizationId = null
+      this.inlineAuthorizationForm = { level: '', province: '', city: '', district: '', effectiveDate: '', expiryDate: '' }
+      this.inlineContractId = null
+      this.inlineContractNumber = ''
+      this.showProjectAssociationPicker = false
+      this.projectAssociationProjectId = ''
+      this.showPartnershipEditor = false
+      this.editingPartnershipId = null
+      this.showProjectEditor = false
+      this.showAuthorizationEditor = false
+      this.showContractEditor = false
       this.expandedProgressIntervalKey = ''
       this.expandedProgressUpdateId = null
-      this.expandedCustomerProgressStage = this.editCustomer.progress
+      this.expandedCustomerProgressStage = ''
       this.customerFollowUpsError = ''
       this.showUnsavedConfirm = false
+      this.showProjectNavigationConfirm = false
+      this.pendingCustomerProjectId = null
+      this.pendingCustomerProjectTarget = null
       this.showEdit = true
+      this.updateCustomerProjectHash(customer.id, this.selectedCustomerProjectId)
       this.loadRegionTree()
-      this.loadCustomerFollowUps(customer.id)
+      this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId)
+    },
+    openCustomerProjectFromHash() {
+      const rawHash = window.location.hash.replace(/^#\/?/, '')
+      const [page, query = ''] = rawHash.split('?')
+      if (page !== 'customers' || !query || this.showEdit) return
+      const params = new URLSearchParams(query)
+      const customerId = Number(params.get('customerId'))
+      const projectId = Number(params.get('projectId'))
+      if (!Number.isInteger(customerId) || !Number.isInteger(projectId)) return
+      const customer = this.customers.find(item => item.id === customerId)
+      const project = this.customerProjects.find(item => item.id === projectId && item.customer?.id === customerId)
+      if (customer && project) this.openCustomerEdit(customer, projectId)
+    },
+    updateCustomerProjectHash(customerId, projectId) {
+      if (!customerId || !projectId || this.activePage !== 'customers') return
+      const params = new URLSearchParams({ customerId: String(customerId), projectId: String(projectId) })
+      history.replaceState(null, '', `#/customers?${params.toString()}`)
+    },
+    async activateCustomerProject(project) {
+      if (!project?.id || project.id === this.selectedCustomerProjectId) return
+      const customer = this.customers[this.editingIndex]
+      if (!customer) return
+      const exactProject = this.customerDetailProjects.find(item => item.id === project.id && item.customer?.id === customer.id)
+      if (!exactProject) return this.showToast('未找到该客户对应的项目记录')
+      this.selectedCustomerProjectId = project.id
+      this.expandedProgressIntervalKey = ''
+      this.expandedProgressUpdateId = null
+      await this.loadCustomerFollowUps(customer.id, project.id)
+      this.updateCustomerProjectHash(customer.id, project.id)
+    },
+    openCustomerProject(project) {
+      if (!project?.id || project.id === this.selectedCustomerProjectId) return
+      if (this.hasUnsavedEdit) {
+        this.pendingCustomerProjectId = project.id
+        this.pendingCustomerProjectTarget = { customerId: this.customers[this.editingIndex]?.id, projectId: project.id }
+        this.showProjectNavigationConfirm = true
+        return
+      }
+      this.activateCustomerProject(project)
+    },
+    async activateAssociatedProject(target) {
+      if (!target?.customerId || !target?.projectId) return
+      const currentCustomer = this.customers[this.editingIndex]
+      if (currentCustomer?.id === target.customerId) {
+        const project = this.customerDetailProjects.find(item => item.id === target.projectId)
+        if (!project) return this.showToast('未找到该项目的客资详情')
+        await this.activateCustomerProject(project)
+        return
+      }
+      const customer = this.customers.find(item => item.id === target.customerId)
+      const project = this.customerProjects.find(item => item.id === target.projectId && item.customer?.id === target.customerId)
+      if (!customer || !project) return this.showToast('未找到可访问的项目客资详情')
+      this.openCustomerEdit(customer, project.id)
+    },
+    openAssociatedProject(association) {
+      const project = association?.project
+      if (!project?.id || !project.customer?.id) return
+      const target = { customerId: project.customer.id, projectId: project.id }
+      if (this.hasUnsavedEdit) {
+        this.pendingCustomerProjectTarget = target
+        this.pendingCustomerProjectId = project.id
+        this.showProjectNavigationConfirm = true
+        return
+      }
+      this.activateAssociatedProject(target)
+    },
+    openProjectAssociationPicker() {
+      this.projectAssociationProjectId = ''
+      this.showProjectAssociationPicker = true
+    },
+    async createProjectAssociation() {
+      const customer = this.customers[this.editingIndex]
+      if (!customer?.id || !this.projectAssociationProjectId || this.businessRecordSaving) return
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(`/api/customers/${customer.id}/project-associations/`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+          body: JSON.stringify({ projectId: this.projectAssociationProjectId }),
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || '项目案例关联失败')
+        this.showProjectAssociationPicker = false
+        this.projectAssociationProjectId = ''
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId, { preserveEditSnapshot: true, preserveStageExpansion: true })
+        this.showToast('项目案例已关联')
+      } catch (error) {
+        this.showToast(error.message || '项目案例关联失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    async removeProjectAssociation(association) {
+      if (!association?.associationId || this.businessRecordSaving) return
+      const confirmed = await this.requestActionConfirm({
+        title: '移除这个项目关联？',
+        message: '只会从当前客户的关联案例中移除，不会删除客资系统中的项目、进度或跟进记录。',
+        confirmLabel: '移除关联',
+      })
+      if (!confirmed) return
+      const customer = this.customers[this.editingIndex]
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(`/api/project-associations/${association.associationId}/`, {
+          method: 'DELETE', headers: { 'X-CSRFToken': this.csrfToken() },
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || '移除关联失败')
+        this.customerAssociatedProjects = this.customerAssociatedProjects.filter(item => item.associationId !== association.associationId)
+        this.showToast('关联已移除，原项目及历史记录保持不变')
+      } catch (error) {
+        this.showToast(error.message || '移除关联失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    async setAssociatedProjectCompletion(association, completed) {
+      const project = association?.project
+      if (!project?.id || this.businessRecordSaving) return
+      const confirmed = await this.requestActionConfirm({
+        title: completed ? '将项目标记为已完成？' : '将项目恢复为未完成？',
+        message: completed
+          ? '项目会移入“已完成”栏并停止作为进行中项目展示；项目资料、阶段记录和关联关系都会保留。'
+          : '项目会返回“未完成”栏，并重新作为进行中项目参与后续跟进。',
+        confirmLabel: completed ? '标记完成' : '恢复未完成',
+      })
+      if (!confirmed) return
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(`/api/projects/${project.id}/`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+          body: JSON.stringify({ isActive: !completed }),
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || '项目完成状态更新失败')
+        const updatedProject = data.project
+        this.customerAssociatedProjects = this.customerAssociatedProjects.map(item => (
+          item.associationId === association.associationId ? { ...item, project: updatedProject } : item
+        ))
+        this.customerProjects = this.customerProjects.map(item => item.id === updatedProject.id ? updatedProject : item)
+        this.customerDetailProjects = this.customerDetailProjects.map(item => item.id === updatedProject.id ? updatedProject : item)
+        this.showToast(completed ? '项目已标记完成' : '项目已恢复为未完成')
+      } catch (error) {
+        this.showToast(error.message || '项目完成状态更新失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    selectCustomerProject(project) {
+      this.openCustomerProject(project)
+    },
+    cancelProjectNavigation() {
+      if (this.savingEdit) return
+      this.showProjectNavigationConfirm = false
+      this.pendingCustomerProjectId = null
+      this.pendingCustomerProjectTarget = null
+    },
+    async discardAndOpenCustomerProject() {
+      const target = this.pendingCustomerProjectTarget
+      const customer = this.customers[this.editingIndex]
+      if (!target || !customer) return this.cancelProjectNavigation()
+      this.editCustomer = this.editCustomerFromRecord(customer)
+      this.editSnapshot = JSON.stringify(this.editCustomer)
+      this.showProjectNavigationConfirm = false
+      this.pendingCustomerProjectId = null
+      this.pendingCustomerProjectTarget = null
+      await this.activateAssociatedProject(target)
+    },
+    async saveAndOpenCustomerProject() {
+      const target = this.pendingCustomerProjectTarget
+      if (!target) return this.cancelProjectNavigation()
+      const saved = await this.saveCustomerEdit({ keepOpen: true })
+      if (!saved) return
+      this.showProjectNavigationConfirm = false
+      this.pendingCustomerProjectId = null
+      this.pendingCustomerProjectTarget = null
+      await this.activateAssociatedProject(target)
+    },
+    openProjectEditor(project = null) {
+      this.editingProjectId = project?.id || null
+      this.projectForm = project ? {
+        name: project.name || '', projectTypeId: project.projectType?.id || '', progress: project.progress || '需求对接',
+        ownerId: project.businessOwner?.id || '', techId: project.technicalOwner?.id || '',
+        plan: project.plan || '', commercialNotes: project.commercialNotes || '', quotedAmount: project.quotedAmount ?? '', contractAmount: project.contractAmount ?? '',
+      } : { name: '', projectTypeId: '', progress: '需求对接', ownerId: this.editCustomer.ownerId || '', techId: this.editCustomer.techId || '', plan: '', commercialNotes: '', quotedAmount: '', contractAmount: '' }
+      this.showProjectEditor = true
+    },
+    async saveProjectRecord() {
+      const customer = this.customers[this.editingIndex]
+      if (!customer?.id || this.businessRecordSaving) return
+      if (!this.projectForm.name.trim()) {
+        this.showToast('请填写项目名称')
+        this.$nextTick(() => document.querySelector('.business-editor-modal input')?.focus())
+        return
+      }
+      this.businessRecordSaving = true
+      try {
+        const originalProject = this.customerDetailProjects.find(project => project.id === this.editingProjectId)
+        if (this.confirmStageChange && !(await this.confirmStageChange(originalProject?.progress, this.projectForm.progress))) return
+        const response = await fetch(this.editingProjectId ? `/api/projects/${this.editingProjectId}/` : `/api/customers/${customer.id}/projects/`, {
+          method: this.editingProjectId ? 'PATCH' : 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+          body: JSON.stringify(this.projectForm),
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || `项目保存失败（${response.status}）`)
+        this.showProjectEditor = false
+        this.editingProjectId = null
+        await this.loadCustomers()
+        await this.loadCustomerFollowUps(customer.id, data.project.id)
+        this.showToast('项目已保存；进度与跟进记录按项目独立管理')
+      } catch (error) {
+        this.showToast(error.message || '项目保存失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    async archiveProjectRecord() {
+      if (!this.editingProjectId) return
+      const confirmed = await this.requestActionConfirm({
+        title: '归档当前项目？',
+        message: '项目会从有效项目中移除，但历史进度与小节点记录都会保留。',
+        confirmLabel: '确认归档',
+        tone: 'warning',
+      })
+      if (!confirmed) return
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(`/api/projects/${this.editingProjectId}/`, { method: 'DELETE', headers: { 'X-CSRFToken': this.csrfToken() } })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || '项目归档失败')
+        const customer = this.customers[this.editingIndex]
+        this.showProjectEditor = false
+        await this.loadCustomers()
+        await this.loadCustomerFollowUps(customer.id)
+        this.showToast('项目已归档，历史数据仍保留')
+      } catch (error) {
+        this.showToast(error.message || '项目归档失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    handleRoadmapWheel(event) {
+      const scroller = event.currentTarget
+      if (!scroller || scroller.scrollWidth <= scroller.clientWidth) return
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
+      if (!delta) return
+      const maximum = scroller.scrollWidth - scroller.clientWidth
+      const nextPosition = Math.max(0, Math.min(maximum, scroller.scrollLeft + delta))
+      if (nextPosition === scroller.scrollLeft) return
+      event.preventDefault()
+      scroller.scrollLeft = nextPosition
+    },
+    async addInlinePartnershipIdentity(identityType) {
+      const customer = this.customers[this.editingIndex]
+      if (identityType === this.activeCustomerPartnerships[0]?.type) return
+      const replacingIdentity = this.activeCustomerPartnerships.length > 0
+      this.inlinePartnershipType = identityType
+      if (!customer?.id || !identityType || this.businessRecordSaving) return
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(`/api/customers/${customer.id}/partnerships/`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+          body: JSON.stringify({ type: identityType, notes: '' }),
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || '合作身份添加失败')
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId, { preserveEditSnapshot: true, preserveStageExpansion: true })
+        this.customerRelationshipExpanded = true
+        this.showToast(replacingIdentity ? '合作身份已替换，原身份已转为历史记录' : '合作身份已添加')
+      } catch (error) {
+        this.inlinePartnershipType = ''
+        this.showToast(error.message || '合作身份添加失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    async removeInlinePartnershipIdentity(identity) {
+      if (!identity?.id || this.businessRecordSaving) return
+      const confirmed = await this.requestActionConfirm({
+        title: `移除“${identity.label}”身份？`,
+        message: '只停用当前合作身份标签，既有授权、合同和历史记录仍会保留。',
+        confirmLabel: '移除身份',
+      })
+      if (!confirmed) return
+      const customer = this.customers[this.editingIndex]
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(`/api/partnerships/${identity.id}/`, {
+          method: 'DELETE', headers: { 'X-CSRFToken': this.csrfToken() },
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || '合作身份移除失败')
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId, { preserveEditSnapshot: true, preserveStageExpansion: true })
+        this.showToast('合作身份已移除，历史记录仍保留')
+      } catch (error) {
+        this.showToast(error.message || '合作身份移除失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    selectInlineAuthorizationProvince(value) {
+      this.inlineAuthorizationForm.province = value
+      this.inlineAuthorizationForm.city = ''
+      this.inlineAuthorizationForm.district = ''
+    },
+    selectInlineAuthorizationCity(value) {
+      this.inlineAuthorizationForm.city = value
+      this.inlineAuthorizationForm.district = ''
+    },
+    async saveInlineCooperationInfo() {
+      const customer = this.customers[this.editingIndex]
+      const level = this.inlineAgentLevel
+      const contractNumber = this.inlineContractNumber.trim()
+      if (!customer?.id || this.businessRecordSaving) return
+      let authorizationPayload = null
+      if (level) {
+        const { province, city, district, effectiveDate, expiryDate } = this.inlineAuthorizationForm
+        if (!province || (level !== 'province' && !city) || (level === 'district' && !district)) {
+          return this.showToast('请完善与代理级别对应的授权区域')
+        }
+        if (!effectiveDate || !expiryDate) return this.showToast('请填写完整的代理期限')
+        if (expiryDate < effectiveDate) return this.showToast('代理到期日期不能早于生效日期')
+        const existing = this.customerAuthorizations.find(item => item.id === this.inlineAuthorizationId)
+        authorizationPayload = {
+          level,
+          province,
+          city: level === 'province' ? '' : city,
+          district: level === 'district' ? district : '',
+          isExclusive: existing?.isExclusive || false,
+          productScope: existing?.productScope || '全部产品及业务',
+          effectiveDate,
+          expiryDate,
+          agreementStatus: existing?.agreementStatus || 'intent',
+          agreementNumber: existing?.agreementNumber || '',
+        }
+      }
+      if (!authorizationPayload && !contractNumber) return this.showToast('请输入合同编号')
+      this.businessRecordSaving = true
+      try {
+        if (authorizationPayload) {
+          const authorizationResponse = await fetch(this.inlineAuthorizationId ? `/api/authorizations/${this.inlineAuthorizationId}/` : `/api/customers/${customer.id}/authorizations/`, {
+            method: this.inlineAuthorizationId ? 'PATCH' : 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+            body: JSON.stringify(authorizationPayload),
+          })
+          const authorizationData = await authorizationResponse.json()
+          if (!authorizationResponse.ok) throw new Error(authorizationData.error || '代理信息保存失败')
+        }
+        if (contractNumber) {
+          const contractResponse = await fetch(this.inlineContractId ? `/api/contracts/${this.inlineContractId}/` : `/api/customers/${customer.id}/contracts/`, {
+            method: this.inlineContractId ? 'PATCH' : 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+            body: JSON.stringify(this.inlineContractId ? { contractNumber } : {
+              title: `${customer.name}合作合同`, contractNumber, status: 'intent', projectId: this.selectedCustomerProjectId || '',
+            }),
+          })
+          const contractData = await contractResponse.json()
+          if (!contractResponse.ok) throw new Error(contractData.error || '合同编号保存失败')
+        }
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId, { preserveEditSnapshot: true, preserveStageExpansion: true })
+        if (authorizationPayload && this.activePage === 'heatmap') await this.loadRegionalMap()
+        this.showToast('合作信息已保存')
+      } catch (error) {
+        this.showToast(error.message || '合作信息保存失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    openPartnershipEditor(item = null) {
+      this.editingPartnershipId = item?.id || null
+      this.partnershipForm = {
+        type: item?.type || 'customer',
+        notes: item?.notes || '',
+      }
+      this.showPartnershipEditor = true
+    },
+    async savePartnership() {
+      const customer = this.customers[this.editingIndex]
+      if (!customer?.id || this.businessRecordSaving) return
+      const isEditing = Boolean(this.editingPartnershipId)
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(isEditing ? `/api/partnerships/${this.editingPartnershipId}/` : `/api/customers/${customer.id}/partnerships/`, {
+          method: isEditing ? 'PATCH' : 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() },
+          body: JSON.stringify(isEditing ? { notes: this.partnershipForm.notes, isActive: true } : this.partnershipForm),
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || '合作身份保存失败')
+        this.showPartnershipEditor = false
+        this.editingPartnershipId = null
+        this.partnershipForm = { type: 'customer', notes: '' }
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId)
+        this.customerRelationshipExpanded = true
+        this.showToast(isEditing ? '合作身份说明已更新' : '合作身份已添加；原有身份不会被替换')
+      } catch (error) {
+        this.showToast(error.message || '合作身份保存失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    async archivePartnership() {
+      if (!this.editingPartnershipId || this.businessRecordSaving) return
+      const confirmed = await this.requestActionConfirm({
+        title: '停用这个合作身份？',
+        message: '合作身份会从客户当前标签中移除，但历史记录仍会保留。',
+        confirmLabel: '确认停用',
+      })
+      if (!confirmed) return
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(`/api/partnerships/${this.editingPartnershipId}/`, {
+          method: 'DELETE', headers: { 'X-CSRFToken': this.csrfToken() },
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || '合作身份停用失败')
+        const customer = this.customers[this.editingIndex]
+        this.showPartnershipEditor = false
+        this.editingPartnershipId = null
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId)
+        this.showToast('合作身份已停用，历史记录仍保留')
+      } catch (error) {
+        this.showToast(error.message || '合作身份停用失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    openAuthorizationEditor(item = null) {
+      const today = this.formatLocalDate(new Date())
+      const nextYear = new Date(); nextYear.setFullYear(nextYear.getFullYear() + 1)
+      this.editingAuthorizationId = item?.id || null
+      this.authorizationForm = item ? {
+        level: item.level, province: item.province, city: item.city || '', district: item.district || '', isExclusive: item.isExclusive,
+        productScope: item.productScope || '', effectiveDate: item.effectiveDate || '', expiryDate: item.expiryDate || '', agreementStatus: item.agreementStatus, agreementNumber: item.agreementNumber || '',
+      } : { level: 'province', province: '', city: '', district: '', isExclusive: false, productScope: '', effectiveDate: today, expiryDate: this.formatLocalDate(nextYear), agreementStatus: 'intent', agreementNumber: '' }
+      this.showAuthorizationEditor = true
+    },
+    async saveAuthorization() {
+      const customer = this.customers[this.editingIndex]
+      if (!customer?.id || this.businessRecordSaving) return
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(this.editingAuthorizationId ? `/api/authorizations/${this.editingAuthorizationId}/` : `/api/customers/${customer.id}/authorizations/`, {
+          method: this.editingAuthorizationId ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() }, body: JSON.stringify(this.authorizationForm),
+        })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || '代理授权保存失败')
+        this.showAuthorizationEditor = false
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId)
+        if (this.activePage === 'heatmap') await this.loadRegionalMap()
+        this.showToast('区域代理授权已保存')
+      } catch (error) {
+        this.showToast(error.message || '代理授权保存失败')
+      } finally {
+        this.businessRecordSaving = false
+      }
+    },
+    async terminateAuthorization() {
+      if (!this.editingAuthorizationId) return
+      const confirmed = await this.requestActionConfirm({
+        title: '终止代理授权？',
+        message: '该授权将标记为已终止，历史授权记录仍会保留。',
+        confirmLabel: '确认终止',
+      })
+      if (!confirmed) return
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(`/api/authorizations/${this.editingAuthorizationId}/`, { method: 'DELETE', headers: { 'X-CSRFToken': this.csrfToken() } })
+        const data = await response.json(); if (!response.ok) throw new Error(data.error || '终止授权失败')
+        const customer = this.customers[this.editingIndex]
+        this.showAuthorizationEditor = false
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId)
+        this.showToast('代理授权已终止，历史记录已保留')
+      } catch (error) { this.showToast(error.message || '终止授权失败') } finally { this.businessRecordSaving = false }
+    },
+    openContractEditor(item = null) {
+      this.editingContractId = item?.id || null
+      this.contractForm = item ? {
+        title: item.title, contractNumber: item.contractNumber || '', projectId: item.projectId || '', status: item.status, amount: item.amount ?? '',
+        signedDate: item.signedDate || '', effectiveDate: item.effectiveDate || '', expiryDate: item.expiryDate || '', notes: item.notes || '',
+      } : { title: '', contractNumber: '', projectId: this.selectedCustomerProjectId || '', status: 'intent', amount: '', signedDate: '', effectiveDate: '', expiryDate: '', notes: '' }
+      this.showContractEditor = true
+    },
+    async saveContract() {
+      const customer = this.customers[this.editingIndex]
+      if (!customer?.id || this.businessRecordSaving) return
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(this.editingContractId ? `/api/contracts/${this.editingContractId}/` : `/api/customers/${customer.id}/contracts/`, {
+          method: this.editingContractId ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRFToken': this.csrfToken() }, body: JSON.stringify(this.contractForm),
+        })
+        const data = await response.json(); if (!response.ok) throw new Error(data.error || '合同保存失败')
+        this.showContractEditor = false
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId)
+        this.showToast('合同信息已保存，状态与合作身份独立维护')
+      } catch (error) { this.showToast(error.message || '合同保存失败') } finally { this.businessRecordSaving = false }
+    },
+    async terminateContract() {
+      if (!this.editingContractId) return
+      const confirmed = await this.requestActionConfirm({
+        title: '终止当前合同？',
+        message: '合同状态将变为已终止，合同历史和关联项目仍会保留。',
+        confirmLabel: '确认终止',
+      })
+      if (!confirmed) return
+      this.businessRecordSaving = true
+      try {
+        const response = await fetch(`/api/contracts/${this.editingContractId}/`, { method: 'DELETE', headers: { 'X-CSRFToken': this.csrfToken() } })
+        const data = await response.json(); if (!response.ok) throw new Error(data.error || '终止合同失败')
+        const customer = this.customers[this.editingIndex]
+        this.showContractEditor = false
+        await this.loadCustomerFollowUps(customer.id, this.selectedCustomerProjectId)
+        this.showToast('合同已标记为终止')
+      } catch (error) { this.showToast(error.message || '终止合同失败') } finally { this.businessRecordSaving = false }
     },
     requestCloseEdit() {
       this.openRegionMenu = ''
@@ -2866,13 +4231,21 @@ createApp({
       }
       this.closeCustomerEdit()
     },
-    closeCustomerEdit() {
+    closeCustomerEdit(options = {}) {
       const visitorReturnId = this.visitorDetailReturnRecordId
+      if (this.actionConfirm.open) this.resolveActionConfirm(false)
       this.closeFollowTaskEditor()
       this.closeFollowTaskDelete()
       this.closeManualTaskDialog()
+      this.showPartnershipEditor = false
+      this.editingPartnershipId = null
+      this.showProjectEditor = false
+      this.showAuthorizationEditor = false
+      this.showContractEditor = false
       this.showCustomerDelete = false
       this.showUnsavedConfirm = false
+      this.showProjectNavigationConfirm = false
+      this.pendingCustomerProjectId = null
       this.showEdit = false
       this.editingIndex = -1
       this.editSnapshot = ''
@@ -2882,16 +4255,37 @@ createApp({
       this.customerSchemeCalculation = null
       this.customerMaterialExperiment = null
       this.customerCanManageProject = false
+      this.customerCanManageCommercial = false
+      this.customerDetailProjects = []
+      this.customerAssociatedProjects = []
+      this.customerProjectsExpanded = false
+      this.selectedCustomerProjectId = null
+      this.customerPartnerships = []
+      this.customerAuthorizations = []
+      this.customerContracts = []
+      this.customerAttachments = []
+      this.customerRelationshipExpanded = false
+      this.inlinePartnershipType = ''
+      this.inlineAuthorizationId = null
+      this.inlineAuthorizationForm = { level: '', province: '', city: '', district: '', effectiveDate: '', expiryDate: '' }
+      this.inlineContractId = null
+      this.inlineContractNumber = ''
+      this.showProjectAssociationPicker = false
+      this.projectAssociationProjectId = ''
       this.expandedProgressIntervalKey = ''
       this.expandedProgressUpdateId = null
       this.expandedCustomerProgressStage = ''
       this.customerFollowUpsError = ''
+      if (this.activePage === 'customers' && window.location.hash.includes('?')) {
+        history.replaceState(null, '', '#/customers')
+      }
       if (visitorReturnId) {
         this.visitorDetailReturnRecordId = null
         const record = this.visitorRecords.find(item => item.id === visitorReturnId)
         this.activeVisitorRecord = record || null
         this.showVisitorDetail = Boolean(record)
       }
+      if (!options.preserveReturnContext) this.customerEditReturnContext = null
     },
     discardCustomerEdit() {
       this.closeCustomerEdit()
@@ -2939,37 +4333,82 @@ createApp({
         this.deletingCustomer = false
       }
     },
-    async saveCustomerEdit() {
-      if (this.savingEdit) return
+    async saveCustomerEdit(options = {}) {
+      if (this.savingEdit) return false
+      if (this.customerFollowUpsLoading) { this.showToast('项目资料仍在加载，请稍后保存'); return false }
+      if (this.customerFollowUpsError) { this.showToast('项目资料加载失败，请重新打开客资后再保存'); return false }
+      const keepOpen = Boolean(options.keepOpen)
       this.showUnsavedConfirm = false
-      if (this.editingIndex < 0 || !this.customers[this.editingIndex]) return
+      if (this.editingIndex < 0 || !this.customers[this.editingIndex]) return false
+      const projectName = this.editCustomer.projectName.trim()
+      const primaryProject = this.customerDetailProjects[0]
+      const selectedProject = this.customerDetailProjects.find(project => project.id === this.selectedCustomerProjectId)
+      const creatingFirstProject = !primaryProject && Boolean(projectName)
+      if (!this.isValidCustomerPhone(this.editCustomer.phone)) {
+        this.showToast('请填写联系方式（电话、微信或 QQ，最多100个字符）')
+        this.$nextTick(() => {
+          this.$refs.editCustomerPhoneInput?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+          this.$refs.editCustomerPhoneInput?.focus()
+        })
+        return false
+      }
+      const hasProjectDetails = this.editCustomerShowsFullProjectModules && (this.editCustomer.projectTypeId || this.editCustomer.plan.trim() || this.editCustomer.progress !== '需求对接')
+      if ((primaryProject || hasProjectDetails) && !projectName) {
+        this.showToast('请填写项目名称')
+        this.$nextTick(() => {
+          this.$refs.editProjectNameInput?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+          this.$refs.editProjectNameInput?.focus()
+        })
+        return false
+      }
+      if (primaryProject && !selectedProject) {
+        this.showToast('未找到当前项目，请刷新后重新进入')
+        return false
+      }
+      const editingNonPrimaryProject = Boolean(primaryProject && selectedProject.id !== primaryProject.id)
       if (this.editCustomer.source === '朋友介绍' && !this.editCustomer.referrer.trim()) {
         this.showToast('朋友介绍的客资必须填写介绍人')
-        return
+        return false
       }
-      if (!this.editCustomer.province || !this.editCustomer.city) {
-        this.showToast('请选择项目所在的省份和城市')
-        return
+      if ((selectedProject || creatingFirstProject) && (!(this.editCustomer.locationMode === 'overseas' ? this.editCustomer.country.trim() : this.editCustomer.province) || !this.editCustomer.city.trim())) {
+        this.showToast(this.editCustomer.locationMode === 'overseas' ? '请填写国家 / 地区和城市' : '请选择项目所在的省份和城市')
+        return false
       }
       const original = this.customers[this.editingIndex]
       if (!original.id) {
         this.showToast('该客资尚未同步到数据库，请刷新页面后重试')
-        return
+        return false
       }
       this.savingEdit = true
       try {
+        if (this.confirmStageChange && !(await this.confirmStageChange(selectedProject?.progress, this.editCustomer.progress))) return false
+        if ((original.name !== this.editCustomer.name || original.phone !== this.editCustomer.phone) && this.confirmCustomerDuplicates && !(await this.confirmCustomerDuplicates([{ ...this.editCustomer, id: original.id }]))) return false
+        const customerPayload = { ...this.editCustomer, projectId: selectedProject?.id || null, allowIncomplete: !primaryProject }
         const response = await fetch(`/api/customers/${original.id}/`, {
           method: 'PATCH',
           headers: {
             'Content-Type': 'application/json',
             'X-CSRFToken': this.csrfToken(),
           },
-          body: JSON.stringify(this.editCustomer),
+          body: JSON.stringify(customerPayload),
         })
         const data = await response.json()
         if (!response.ok) throw new Error(data.error || `保存失败（${response.status}）`)
+        let savedProject = data.project || null
         const savedCustomer = data.customer
-        const returnToVisitorDetail = Boolean(this.visitorDetailReturnRecordId)
+        if (savedProject) {
+          const existingProjectIndex = this.customerDetailProjects.findIndex(project => project.id === savedProject.id)
+          if (existingProjectIndex >= 0) this.customerDetailProjects.splice(existingProjectIndex, 1, savedProject)
+          else this.customerDetailProjects.push(savedProject)
+          this.selectedCustomerProjectId = savedProject.id
+          this.customerAssociatedProjects = this.customerAssociatedProjects.map(item => (
+            item.project?.id === savedProject.id ? { ...item, project: savedProject } : item
+          ))
+          const cachedIndex = this.customerProjects.findIndex(project => project.id === savedProject.id)
+          if (cachedIndex >= 0) this.customerProjects.splice(cachedIndex, 1, savedProject)
+          else this.customerProjects.push(savedProject)
+          if (!editingNonPrimaryProject) savedCustomer.projectName = savedProject.name
+        }
         savedCustomer.percent = this.stagePercent(savedCustomer.progress)
         this.customers.splice(this.editingIndex, 1, savedCustomer)
         this.visitorRecords = this.visitorRecords.map(record => (
@@ -2977,18 +4416,27 @@ createApp({
             ? { ...record, customer: { ...record.customer, id: savedCustomer.id, name: savedCustomer.name, grade: savedCustomer.grade, phone: savedCustomer.phone, source: savedCustomer.source } }
             : record
         ))
-        this.customerPool = savedCustomer.grade === 'D' ? 'dormant' : 'active'
+        this.customerPool = 'active'
         this.provinceData = this.buildProvinceData(this.customers)
         this.syncSummaryData()
         await this.loadFollowUpTasks()
-        this.closeCustomerEdit()
-        if (!returnToVisitorDetail) {
-          this.resetFilters()
-          this.switchPage('customers')
+        if (keepOpen) {
+          this.editSnapshot = JSON.stringify(this.editCustomer)
+        } else {
+          const returnContext = this.customerEditReturnContext
+          const returnProject = savedProject || selectedProject || null
+          this.closeCustomerEdit({ preserveReturnContext: true })
+          const visible = this.restoreCustomerEditReturnContext(savedCustomer, returnProject, returnContext)
+          if (visible === false) {
+            this.showToast(`${savedCustomer.name} 已保存，但修改后不符合当前筛选条件`)
+            return true
+          }
         }
         this.showToast(`${savedCustomer.name} 的客资信息已保存到数据库`)
+        return true
       } catch (error) {
         this.showToast(`保存失败：${error.message || '请稍后重试'}`)
+        return false
       } finally {
         this.savingEdit = false
       }
@@ -2997,22 +4445,44 @@ createApp({
       if (this.savingCreate) return
       const name = this.newCustomer.name.trim()
       const phone = this.newCustomer.phone.trim()
+      const projectName = this.newCustomer.projectName.trim()
       const isReferral = this.newCustomer.source === '朋友介绍'
       if (!name || !phone) {
-        this.showToast('请填写客户名称和联系电话')
+        this.showToast('请填写客户名称和联系方式')
+        return
+      }
+      if (!this.isValidCustomerPhone(phone)) {
+        this.showToast('请填写联系方式（电话、微信或 QQ，最多100个字符）')
+        this.$nextTick(() => {
+          this.$refs.newCustomerPhoneInput?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+          this.$refs.newCustomerPhoneInput?.focus()
+        })
+        return
+      }
+      if (!projectName) {
+        this.showToast('请填写项目名称')
+        this.$nextTick(() => {
+          this.$refs.newProjectNameInput?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+          this.$refs.newProjectNameInput?.focus()
+        })
         return
       }
       if (isReferral && !this.newCustomer.referrer.trim()) {
         this.showToast('朋友介绍的客资必须填写介绍人')
         return
       }
-      if (!this.newCustomer.province || !this.newCustomer.city || !this.newCustomer.district) {
-        this.showToast('请从候选项中完整选择项目所在的省、市、区 / 县')
+      if (!(this.newCustomer.locationMode === 'overseas' ? this.newCustomer.country.trim() : this.newCustomer.province) || !this.newCustomer.city.trim()) {
+        this.showToast(this.newCustomer.locationMode === 'overseas' ? '请填写国家 / 地区和城市' : '请从候选项中选择项目所在的省份和城市；区 / 县可不填')
         return
       }
-      const businessOwner = this.employees.business.find(employee => employee.id === this.newCustomer.ownerId)
-      const technicalOwner = this.employees.technical.find(employee => employee.id === this.newCustomer.techId)
-      if (!businessOwner || !technicalOwner) {
+      const requiresProjectOwners = this.newCustomerShowsFullProjectModules
+      const businessOwner = requiresProjectOwners
+        ? this.employees.business.find(employee => employee.id === this.newCustomer.ownerId)
+        : null
+      const technicalOwner = requiresProjectOwners
+        ? this.employees.technical.find(employee => employee.id === this.newCustomer.techId)
+        : null
+      if (requiresProjectOwners && (!businessOwner || !technicalOwner)) {
         this.showToast('请选择状态可用的商务负责人和技术负责人')
         return
       }
@@ -3020,13 +4490,20 @@ createApp({
         ...this.newCustomer,
         name,
         phone,
-        ownerId: businessOwner.id,
-        techId: technicalOwner.id,
+        projectName,
+        projectTypeId: requiresProjectOwners ? this.newCustomer.projectTypeId : '',
+        progress: requiresProjectOwners ? this.newCustomer.progress : '需求对接',
+        plan: requiresProjectOwners ? this.newCustomer.plan : '',
+        ownerId: businessOwner?.id || '',
+        owner: businessOwner?.display_name || '',
+        techId: technicalOwner?.id || '',
+        tech: technicalOwner?.display_name || '',
         referrer: isReferral ? this.newCustomer.referrer.trim() : '',
       }
       this.showCreateUnsavedConfirm = false
       this.savingCreate = true
       try {
+        if (this.confirmCustomerDuplicates && !(await this.confirmCustomerDuplicates([payload]))) return
         const response = await fetch('/api/customers/', {
           method: 'POST',
           headers: {
@@ -3039,11 +4516,11 @@ createApp({
         if (!response.ok) throw new Error(data.error || `保存失败（${response.status}）`)
         data.customer.percent = this.stagePercent(data.customer.progress)
         this.customers.unshift(data.customer)
-        this.customerPool = data.customer.grade === 'D' ? 'dormant' : 'active'
+        this.customerPool = 'active'
         this.provinceData = this.buildProvinceData(this.customers)
         this.syncSummaryData()
         this.closeCreateCustomer()
-        this.switchPage('customers')
+        this.returnToSavedCustomer(data.customer.id)
         this.showToast(`${name} 已保存到客资数据库`)
       } catch (error) {
         this.showToast(`新增失败：${error.message || '请稍后重试'}`)
@@ -3056,6 +4533,7 @@ createApp({
     this.scheduleVisitorPeopleOverflowCheck()
   },
   mounted() {
+    this.loadOverviewStatistics()
     this.loadRegionTree()
     this.loadEmployees()
     this.loadCustomers()
@@ -3070,12 +4548,22 @@ createApp({
     })
     this.scheduleVisitorPeopleOverflowCheck()
     window.addEventListener('hashchange', () => {
-      const page = window.location.hash.replace(/^#\/?/, '')
+      const page = window.location.hash.replace(/^#\/?/, '').split('?')[0]
       if (this.navItems.some(item => item.id === page) && page !== this.activePage) this.switchPage(page)
     })
     window.addEventListener('keydown', event => {
       if (event.key === 'Escape') {
-        if (this.showVisitorForm) {
+        const popover = document.querySelector('.floating-menu-layer')
+        if (popover) {
+          popover._floatingClose?.()
+          event.preventDefault()
+          return
+        }
+        if (this.actionConfirm.open) {
+          this.resolveActionConfirm(false)
+        } else if (this.showProjectNavigationConfirm) {
+          this.cancelProjectNavigation()
+        } else if (this.showVisitorForm) {
           this.closeVisitorForm()
         } else if (this.showVisitorDetail) {
           this.closeVisitorDetail()
@@ -3089,6 +4577,15 @@ createApp({
           this.closeFollowTaskDelete()
         } else if (this.showManualTaskCreate) {
           this.closeManualTaskDialog()
+        } else if (this.showPartnershipEditor) {
+          this.showPartnershipEditor = false
+          this.editingPartnershipId = null
+        } else if (this.showProjectEditor) {
+          this.showProjectEditor = false
+        } else if (this.showAuthorizationEditor) {
+          this.showAuthorizationEditor = false
+        } else if (this.showContractEditor) {
+          this.showContractEditor = false
         } else if (this.showCustomerDelete) {
           this.closeCustomerDelete()
         } else if (this.showUnsavedConfirm) {
@@ -3099,10 +4596,12 @@ createApp({
           this.showCreateUnsavedConfirm = false
         } else if (this.showCreate) {
           this.requestCloseCreate()
+        } else if (this.showBatchCustomerCreate) {
+          this.requestCloseBatchCustomerCreate()
         }
       }
     })
     window.addEventListener('click', () => { this.openRegionMenu = '' })
-    if (this.activePage === 'heatmap') nextTick(() => this.renderMap())
+    if (this.activePage === 'heatmap') this.loadRegionalMap()
   },
 }).mount('#app')

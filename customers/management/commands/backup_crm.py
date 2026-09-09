@@ -58,6 +58,13 @@ def add_sheet(workbook, title, headers, rows, widths=None):
 class Command(BaseCommand):
     help = 'Backup the CRM SQLite database and export a readable Excel workbook.'
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--database-only',
+            action='store_true',
+            help='Create the SQLite backup without querying application models.',
+        )
+
     def handle(self, *args, **options):
         lock_path = Path(settings.DATA_DIR) / 'backup.lock'
         lock_handle = None
@@ -78,13 +85,13 @@ class Command(BaseCommand):
                     continue
                 return
         try:
-            self._perform_backup()
+            self._perform_backup(database_only=options['database_only'])
         finally:
             if lock_handle is not None:
                 os.close(lock_handle)
             lock_path.unlink(missing_ok=True)
 
-    def _perform_backup(self):
+    def _perform_backup(self, *, database_only=False):
         base_dir = Path(settings.BASE_DIR)
         backup_dir = base_dir / 'backups'
         export_dir = base_dir / 'exports'
@@ -98,6 +105,10 @@ class Command(BaseCommand):
             with sqlite3.connect(backup_database) as target:
                 source.backup(target)
 
+        if database_only:
+            self.stdout.write(str(backup_database))
+            return
+
         workbook = Workbook()
         workbook.remove(workbook.active)
 
@@ -108,9 +119,9 @@ class Command(BaseCommand):
         add_sheet(
             workbook,
             '客资信息',
-            ['编号', '等级', '客户名称', '联系电话', '来源', '介绍人',
+            ['编号', '等级', '客户名称', '联系方式', '来源', '介绍人',
              '省', '市', '区县', '项目进度', '商务负责人', '技术负责人',
-             '客户描述', '施工方案', '创建时间', '更新时间'],
+             '客户描述', '施工方案', '创建时间', '更新时间', '国外国家 / 地区', '是否添加微信'],
             ([
                 customer.id, customer.grade, customer.name, customer.phone,
                 customer.source, customer.referrer,
@@ -119,7 +130,7 @@ class Command(BaseCommand):
                 display_user(customer.business_owner) or customer.business_owner_name,
                 display_user(customer.technical_owner) or customer.technical_owner_name,
                 customer.description, customer.plan,
-                customer.created_at, customer.updated_at,
+                customer.created_at, customer.updated_at, customer.country, customer.get_wechat_status_display(),
             ] for customer in customers),
             [8, 8, 22, 18, 14, 16, 12, 12, 14, 24, 16, 16, 42, 42, 20, 20],
         )
@@ -132,14 +143,14 @@ class Command(BaseCommand):
             workbook,
             '项目信息',
             ['编号', '客户', '项目名称', '项目类型', '当前进度', '省', '市', '区县',
-             '商务负责人', '技术负责人', '是否有效', '施工方案', '创建时间', '更新时间'],
+             '商务负责人', '技术负责人', '是否有效', '施工方案', '创建时间', '更新时间', '国外国家 / 地区'],
             ([
                 project.id, project.customer.name, project.name,
                 project.project_type.name if project.project_type else '未分类', project.progress,
                 project.province, project.city, project.district,
                 display_user(project.business_owner), display_user(project.technical_owner),
                 '是' if project.is_active else '否', project.plan,
-                project.created_at, project.updated_at,
+                project.created_at, project.updated_at, project.country,
             ] for project in projects),
             [8, 22, 30, 14, 24, 12, 12, 14, 16, 16, 10, 48, 20, 20],
         )

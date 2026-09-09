@@ -4,6 +4,7 @@ __pycache__/
 db.sqlite3
 .env
 private-backup/
+private-qa-personal/
 data/
 backups/
 exports/

@@ -1,0 +1,108 @@
+<section v-else-if="activePage === 'followups'" class="page personal-project-page">
+  <div class="page-heading">
+    <div><p class="kicker">MY PROJECTS</p><h1>我的客资</h1><span>按实际项目负责人归属，查看客户资料与真实跟进记录</span></div>
+    <themed-select v-if="personalAdmin" v-model="personalEmployee" label="查看员工" :options="[{ value: '', label: '我自己' }, ...personalEmployees]" searchable></themed-select>
+  </div>
+  <section class="panel personal-filter-panel">
+    <div class="personal-toolbar">
+      <div class="personal-segment"><button :class="{ selected: personalStatus === 'active' }" @click="personalStatus = 'active'">进行中</button><button :class="{ selected: personalStatus === 'completed' }" @click="personalStatus = 'completed'">已完成</button></div>
+      <input v-model="personalSearch" aria-label="搜索我的项目" placeholder="搜索客户、联系方式、项目名称" />
+      <div class="personal-segment"><button :class="{ selected: personalSort === 'priority' }" @click="personalSort = 'priority'">优先级</button><button :class="{ selected: personalSort === 'recent' }" @click="personalSort = 'recent'">最近跟进</button></div>
+    </div>
+    <div class="personal-filter-grid">
+      <themed-select v-model="personalFilters.grade" label="客户等级" :options="personalOptions('grade')"></themed-select>
+      <themed-select v-model="personalFilters.source" label="客资来源" :options="personalOptions('source')"></themed-select>
+      <themed-select v-model="personalFilters.province" label="省份" :options="personalOptions('province')" searchable></themed-select>
+      <themed-select v-model="personalFilters.city" label="城市" :options="personalOptions('city')" searchable></themed-select>
+      <themed-select v-model="personalFilters.progress" label="项目进度" :options="personalOptions('progress')"></themed-select>
+      <button class="ghost-btn" @click="resetPersonalFilters">重置筛选</button>
+    </div>
+  </section>
+  <p class="personal-count" v-text="'当前显示 ' + visiblePersonalProjects.length + ' 个项目 · ' + (personalSort === 'priority' ? '等级优先，同级按最近跟进排序' : '按真实跟进时间排序')"></p>
+  <div v-if="personalLoading" class="panel personal-empty">正在加载项目…</div>
+  <div v-else-if="personalError" class="panel personal-empty"><p v-text="personalError"></p><button class="ghost-btn" @click="loadPersonalProjects">重新加载</button></div>
+  <div v-else-if="!visiblePersonalProjects.length" class="panel personal-empty"><h3>暂无匹配项目</h3><p>仅显示实际分配给所选员工的项目，可调整筛选条件。</p></div>
+  <div v-else class="customer-records">
+    <article v-for="project in visiblePersonalProjects" :key="project.id" class="panel customer-record personal-project-record" :id="`personal-project-${project.id}`" :class="{ 'recently-saved': project.id === savedProjectId }">
+      <div class="record-topline personal-project-head">
+        <span class="customer-grade-block" :class="'grade-block-' + project.customer.grade.toLowerCase()" v-text="project.customer.grade"></span>
+        <div class="record-identity personal-project-identity"><button class="personal-project-link" @click="openPersonalProject(project)"><strong v-text="project.customer.name"></strong></button><span class="personal-project-phone" v-text="project.customer.phone"></span></div>
+        <div class="record-location"><span v-text="project.country ? '国家 / 城市 / 地区' : '省 / 市 / 区'"></span><div class="record-location-values"><b v-text="project.country || project.province || '待完善'"></b><i>/</i><b v-text="project.city || '待完善'"></b><i>/</i><b v-text="project.district || '区县待完善'"></b></div></div>
+        <div class="record-source"><span>客资来源</span><strong v-text="project.customer.source || '待完善'"></strong></div>
+        <div class="record-progress"><span>项目进度</span><strong><i aria-hidden="true"></i><b v-text="project.progress"></b></strong></div>
+        <div class="record-owner"><span>商务负责人</span><strong v-text="project.businessOwner?.name || '待分配'"></strong></div>
+        <div class="record-owner"><span>技术负责人</span><strong v-text="project.technicalOwner?.name || '待分配'"></strong></div>
+        <button class="record-more" title="查看详情" aria-label="查看项目详情" @click="openPersonalProject(project)">···</button>
+      </div>
+      <div class="record-details personal-project-details">
+        <section class="description-field"><span>客户描述</span><p :class="{ 'description-expanded': expandedDescriptions['p' + project.id] }" v-text="project.customer.description || '暂无描述'"></p><button v-if="project.customer.description?.length > 55" class="description-toggle" @click="toggleDescription('p' + project.id)" v-text="expandedDescriptions['p' + project.id] ? '收起' : '展开全文'"></button></section>
+        <section class="plan-field personal-project-summary"><span>项目名称</span><p v-text="project.name || '待补充项目名称'"></p><small v-text="'最近跟进 · ' + followupDate(project.latestFollowupAt)"></small><p class="personal-followup-content" :title="project.latestFollowupContent" v-text="project.latestFollowupContent || '尚未记录跟进内容'"></p></section>
+      </div>
+    </article>
+  </div>
+</section>
+<section v-else class="page personal-calendar-page">
+  <div class="page-heading"><div><p class="kicker">MY CALENDAR</p><h1>我的日历</h1><span>私人日程 · 北京时间 · 历史个人安排已保留</span></div><button class="primary-btn" @click="editCalendarEvent()">＋ 新建日程</button></div>
+  <div class="calendar-toolbar">
+    <div class="calendar-navigation"><button aria-label="上一期" title="上一期" @click="moveCalendar(-1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6" /></svg></button><button class="calendar-today" @click="moveCalendar(0)">今天</button><button aria-label="下一期" title="下一期" @click="moveCalendar(1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6 6 6-6 6" /></svg></button></div>
+    <div class="calendar-period"><h2 v-text="calendarTitle"></h2><small v-text="calendarView==='month'?'上下滚动浏览月份 · 点击日期安排日程':'点击日期查看安排'"></small></div>
+    <div class="personal-segment"><button v-for="view in [{id:'month',label:'月'}, {id:'week',label:'周'}, {id:'agenda',label:'日程'}]" :key="view.id" :class="{selected:calendarView===view.id}" @click="calendarView=view.id" v-text="view.label"></button></div>
+  </div>
+  <p v-if="calendarError" class="calendar-error"><span v-text="calendarError"></span> <button @click="loadCalendar">重试</button></p>
+  <div class="calendar-layout">
+    <section class="panel calendar-board" :aria-busy="calendarLoading">
+      <template v-if="calendarView !== 'agenda'">
+        <div class="calendar-weekdays"><span v-for="day in ['一','二','三','四','五','六','日']" v-text="'周' + day"></span></div>
+        <div v-if="calendarView==='month'" ref="calendarScroller" class="calendar-month-scroller" @scroll.passive="onCalendarScroll">
+          <section v-for="month in calendarMonths" :key="month.key" class="calendar-month" :data-calendar-month="month.key" :aria-label="month.label">
+            <header class="calendar-month-label"><h3 v-text="month.label"></h3><span>MONTH</span></header>
+            <div class="calendar-grid">
+              <div v-for="(day,index) in month.cells" :key="day||index" class="calendar-cell" :class="{selected:day&&day===calendarDate,today:day===calendarToday(),empty:!day}" :tabindex="day?0:undefined" :aria-label="day?'选择'+day:undefined" @click="day&&selectCalendarDate(day)" @keydown.enter.self.prevent="day&&selectCalendarDate(day)" @keydown.space.self.prevent="day&&selectCalendarDate(day)">
+                <template v-if="day">
+                  <div class="calendar-date-row"><button class="calendar-day" :aria-label="'查看'+day+'日程'" :aria-pressed="day===calendarDate" @click.stop="selectCalendarDate(day)" v-text="Number(day.slice(8))"></button><span v-if="calendarFestival(day)" class="calendar-festival" :data-short="calendarFestivalCompact(day)" :title="calendarFestival(day)+'（节日标注，非日程或放假安排）'" v-text="calendarFestival(day)"></span></div>
+                  <button v-for="event in eventsOn(day).slice(0,3)" :key="event.id" class="calendar-event" :class="[event.kind,{done:event.isCompleted,cancelled:event.isCancelled}]" :title="event.title" @click.stop="editCalendarEvent(event)"><span v-text="event.isCancelled?'已取消':event.isCompleted?'已完成':event.plannedTime||'全天'"></span><b v-text="event.title"></b></button>
+                  <button v-if="eventsOn(day).length>3" class="calendar-more" @click.stop="selectCalendarDate(day)" v-text="'另有 '+(eventsOn(day).length-3)+' 项'"></button>
+                </template>
+              </div>
+            </div>
+          </section>
+        </div>
+        <div v-else class="calendar-grid calendar-week">
+          <div v-for="day in calendarDays" :key="day" class="calendar-cell" :class="{selected:day===calendarDate,today:day===calendarToday()}" tabindex="0" :aria-label="'选择'+day" @click="selectCalendarDate(day)" @keydown.enter.self.prevent="selectCalendarDate(day)" @keydown.space.self.prevent="selectCalendarDate(day)">
+            <div class="calendar-date-row"><button class="calendar-day" :aria-label="'查看' + day + '日程'" :aria-pressed="day===calendarDate" @click.stop="selectCalendarDate(day)" v-text="Number(day.slice(8))"></button><span v-if="calendarFestival(day)" class="calendar-festival" :data-short="calendarFestivalCompact(day)" :title="calendarFestival(day)+'（节日标注，非日程或放假安排）'" v-text="calendarFestival(day)"></span></div>
+            <button v-for="event in eventsOn(day).slice(0,8)" :key="event.id" class="calendar-event" :class="[event.kind, {done:event.isCompleted, cancelled:event.isCancelled}]" :title="event.title" @click.stop="editCalendarEvent(event)"><span v-text="event.isCancelled?'已取消':event.isCompleted?'已完成':event.plannedTime||'全天'"></span><b v-text="event.title"></b></button>
+            <button v-if="eventsOn(day).length > (calendarView==='week'?8:3)" class="calendar-more" @click.stop="selectCalendarDate(day)" v-text="'＋' + (eventsOn(day).length-(calendarView==='week'?8:3)) + ' 项'"></button>
+          </div>
+        </div>
+      </template>
+      <div v-else class="calendar-agenda">
+        <p v-if="!calendarAgenda.length" class="personal-empty">本月暂无日程，点击“新建日程”开始安排。</p>
+        <button v-for="event in calendarAgenda" :key="event.id" class="agenda-row" :class="{done:event.isCompleted,cancelled:event.isCancelled}" @click="editCalendarEvent(event)"><span v-text="event.plannedDate + ' · ' + (event.plannedTime || '全天')"></span><strong v-text="event.title"></strong><small v-text="eventKindLabel(event.kind) + ' · ' + (event.isCancelled?'已取消':event.isCompleted?'已完成':'待完成')"></small></button>
+      </div>
+    </section>
+    <aside class="panel calendar-detail">
+      <form v-if="calendarEditor" @submit.prevent="saveCalendarEvent">
+        <div class="panel-head"><h2 v-text="calendarEditor.id?'编辑日程':'新建日程'"></h2><button type="button" class="ghost-btn" @click="closeCalendarEditor">关闭</button></div>
+        <label><span>事项标题 *</span><input ref="calendarTitleInput" v-model="calendarEditor.title" maxlength="160" required placeholder="例如：联系客户确认来访时间" /></label>
+        <div class="calendar-time-row"><themed-date-picker v-model="calendarEditor.plannedDate" label="日期 *"></themed-date-picker><label><span>时间（不填为全天）</span><input type="time" v-model="calendarEditor.plannedTime" /></label></div>
+        <themed-select v-model="calendarEditor.kind" label="事项类型" :options="eventKinds"></themed-select>
+        <themed-select v-model="calendarEditor.customerId" label="关联客户（选填）" :options="calendarCustomerOptions" searchable @update:model-value="calendarEditor.projectId=''"></themed-select>
+        <themed-select v-model="calendarEditor.projectId" label="关联项目（选填）" :options="calendarProjectOptions" searchable></themed-select>
+        <themed-select v-model="calendarEditor.reminderMinutes" label="提醒时间" :options="reminderOptions"></themed-select>
+        <label><span>备注</span><textarea v-model="calendarEditor.note" maxlength="5000" rows="3" placeholder="补充约定内容或准备事项"></textarea></label>
+        <p class="calendar-help">仅本人可见。提醒在网站打开时显示；全天事项以09:00为提醒基准。</p>
+        <div class="calendar-editor-actions"><button v-if="calendarEditor.id" type="button" class="calendar-delete" :disabled="calendarSaving" @click="changeCalendarEvent(calendarEditor,'delete')">删除日程</button><button class="primary-btn calendar-save" :disabled="calendarSaving" v-text="calendarSaving?'保存中…':'保存日程'"></button></div>
+      </form>
+      <template v-else>
+        <div class="panel-head"><div><h2 v-text="calendarDate"></h2><span v-if="calendarFestival(calendarDate)" class="calendar-festival calendar-festival-detail" v-text="calendarFestival(calendarDate)"></span></div><button class="ghost-btn" @click="editCalendarEvent()">＋ 添加</button></div>
+        <p v-if="!calendarSelectedEvents.length" class="calendar-help">当天暂无安排。</p>
+        <article v-for="event in calendarSelectedEvents" :key="event.id" class="calendar-detail-item" :class="{done:event.isCompleted,cancelled:event.isCancelled}">
+          <small v-text="(event.plannedTime||'全天') + ' · ' + eventKindLabel(event.kind)"></small><h3 v-text="event.title"></h3><p v-if="event.note" v-text="event.note"></p>
+          <span class="calendar-status" v-text="event.isCancelled?'已取消':event.isCompleted?'已完成':'待完成'"></span>
+          <button v-if="event.customerId||event.projectId" class="description-toggle" @click="openCalendarLink(event)" v-text="event.projectId?'查看关联项目 →':'查看关联客户 →'"></button>
+          <div class="calendar-item-actions"><button @click="editCalendarEvent(event)">编辑</button><button v-if="!event.isCancelled" :disabled="calendarSaving" @click="changeCalendarEvent(event,'complete')" v-text="event.isCompleted?'恢复待办':'完成'"></button><button :disabled="calendarSaving" @click="changeCalendarEvent(event,event.isCancelled?'restore':'cancel')" v-text="event.isCancelled?'恢复':'取消'"></button><button :disabled="calendarSaving" @click="changeCalendarEvent(event,'delete')">删除</button></div>
+        </article>
+      </template>
+    </aside>
+  </div>
+</section>

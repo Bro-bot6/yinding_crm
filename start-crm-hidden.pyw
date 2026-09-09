@@ -9,12 +9,47 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_shared_repository_root() -> Path:
+    git_pointer = BASE_DIR / ".git"
+    if not git_pointer.is_file():
+        return BASE_DIR
+    try:
+        marker, raw_git_dir = git_pointer.read_text(encoding="utf-8").strip().split(":", 1)
+        if marker.lower() != "gitdir":
+            return BASE_DIR
+        git_dir = Path(raw_git_dir.strip())
+        if not git_dir.is_absolute():
+            git_dir = (BASE_DIR / git_dir).resolve()
+        common_dir_file = git_dir / "commondir"
+        if not common_dir_file.exists():
+            return BASE_DIR
+        common_dir = (git_dir / common_dir_file.read_text(encoding="utf-8").strip()).resolve()
+        if common_dir.name == ".git":
+            return common_dir.parent
+    except (OSError, ValueError):
+        pass
+    return BASE_DIR
+
+
+SHARED_ROOT = resolve_shared_repository_root()
 HOST = "127.0.0.1"
 PORT = 8000
 SITE_URL = f"http://{HOST}:{PORT}/"
-PYTHONW = BASE_DIR / ".venv" / "Scripts" / "pythonw.exe"
+PYTHONW = next(
+    (
+        candidate
+        for candidate in (
+            BASE_DIR / ".venv" / "Scripts" / "pythonw.exe",
+            SHARED_ROOT / ".venv" / "Scripts" / "pythonw.exe",
+        )
+        if candidate.exists()
+    ),
+    BASE_DIR / ".venv" / "Scripts" / "pythonw.exe",
+)
 SERVER_SCRIPT = BASE_DIR / "serve-crm.py"
-LOG_DIR = BASE_DIR / "logs"
+LOG_DIR = SHARED_ROOT / "logs"
 LOG_FILE = LOG_DIR / "launcher.log"
 
 
@@ -58,7 +93,8 @@ def start_server() -> bool:
             creationflags=creation_flags,
         )
 
-    for _ in range(30):
+    # First start after an update can include static collection and migrations.
+    for _ in range(120):
         if server_is_ready():
             return True
         time.sleep(0.5)
