@@ -27,6 +27,26 @@ test('short/narrow windows constrain both dimensions without overflow', () => {
   assert.ok(p.top >= b.top)
   assert.ok(p.top + p.maxHeight <= b.bottom)
 })
+test('customer filter menus exactly match their trigger width', () => {
+  assert.equal(context.floatingMenuWidth(126, 190, true), 126)
+  assert.equal(context.floatingMenuWidth(126, 190, false), 190)
+})
+test('calendar popovers keep their readable width inside the customer filter', () => {
+  const field = { closest: selector => selector === '.unified-filter-panel' ? {} : null }
+  const selectMenu = { classList: { contains: value => value === 'custom-select-menu' } }
+  const calendarMenu = { classList: { contains: value => value === 'date-picker-popover' } }
+  assert.equal(context.shouldMatchFilterTrigger(selectMenu, field), true)
+  assert.equal(context.shouldMatchFilterTrigger(calendarMenu, field), false)
+  assert.equal(context.floatingMenuWidth(158, 292, false), 292)
+})
+test('map filter menus exactly match their trigger width', () => {
+  const field = { closest: selector => selector === '.map-filter-strip' ? {} : null }
+  const selectMenu = { classList: { contains: value => value === 'custom-select-menu' } }
+  const calendarMenu = { classList: { contains: value => value === 'date-picker-popover' } }
+  assert.equal(context.shouldMatchFilterTrigger(selectMenu, field), true)
+  assert.equal(context.shouldMatchFilterTrigger(calendarMenu, field), false)
+  assert.equal(context.floatingMenuWidth(160, 190, true), 160)
+})
 test('dates render Chinese year/month/day while model values remain ISO dates', () => {
   assert.equal(context.chineseDate('2026-09-02'), '2026年09月02日')
   assert.equal(context.chineseDate(''), '')

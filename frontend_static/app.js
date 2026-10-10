@@ -1,7 +1,20 @@
 const { createApp, nextTick } = Vue
 
-const CUSTOMER_SOURCES = Object.freeze(['抖音', '视频号', '服务号', '朋友介绍'])
-const CUSTOMER_SOURCE_CLASSES = Object.freeze({ 抖音: 'douyin', 视频号: 'wechat', 服务号: 'service-account', 朋友介绍: 'referral' })
+const CUSTOMER_SOURCES = Object.freeze(['抖音', '视频号', '服务号', '朋友介绍', '其他'])
+const CUSTOMER_SOURCE_CLASSES = Object.freeze({ 抖音: 'douyin', 视频号: 'wechat', 服务号: 'service-account', 朋友介绍: 'referral', 其他: 'other-source' })
+
+// One-time preference migration: every browser starts from the same fresh
+// baseline, then remembers explicit theme choices made with this version.
+const THEME_PREFERENCE_KEY = 'yd-theme-v2'
+const VALID_THEMES = Object.freeze(['minimal', 'midnight', 'fresh'])
+function readThemePreference() {
+  try {
+    const stored = localStorage.getItem(THEME_PREFERENCE_KEY)
+    if (VALID_THEMES.includes(stored)) return stored
+    localStorage.setItem(THEME_PREFERENCE_KEY, 'fresh')
+  } catch (_) { /* Private mode may deny storage; the default still works. */ }
+  return 'fresh'
+}
 
 let themedPopoverSequence = 0
 const nextThemedPopoverId = prefix => `${prefix}-${++themedPopoverSequence}`
@@ -27,12 +40,21 @@ function floatingMenuPosition(anchor, bounds, width, height) {
   }
 }
 
+function floatingMenuWidth(anchorWidth, minimumWidth, matchTriggerWidth = false) {
+  return matchTriggerWidth ? anchorWidth : Math.max(anchorWidth, minimumWidth)
+}
+
+function shouldMatchFilterTrigger(menu, field) {
+  const alignedFilter = field.closest('.unified-filter-panel') || field.closest('.map-filter-strip')
+  return !menu.classList.contains('date-picker-popover') && Boolean(alignedFilter)
+}
+
 // Use one body-level portal in every browser, not native popover positioning.
 // Keep the original field as the anchor throughout this menu's lifetime.
 const FloatingMenuPositioner = {
   mounted(menu, binding) {
     const field = binding.value.field
-    const trigger = field.querySelector('.custom-select-trigger, .searchable-select-control, .themed-date-trigger')
+    const trigger = field.querySelector('.custom-select-trigger, .searchable-select-control, .themed-date-trigger, .calendar-more')
     if (!trigger) return
     const scrollport = field.closest('.edit-scroll')
     const initialStyle = getComputedStyle(menu)
@@ -40,9 +62,10 @@ const FloatingMenuPositioner = {
     // containing block is the viewport, and cached/reopened nodes can retain it.
     const calendar = menu.classList.contains('date-picker-popover')
     const minimumWidth = parseFloat(initialStyle.getPropertyValue('--floating-min-width')) || (calendar ? 292 : 190)
+    const matchTriggerWidth = shouldMatchFilterTrigger(menu, field)
     const preferredHeight = parseFloat(initialStyle.getPropertyValue('--floating-max-height')) || (calendar ? 380 : 330)
     const originalStyle = menu.getAttribute('style')
-    const legacyOptions = !menu.querySelector('[role="listbox"]') && !menu.classList.contains('date-picker-popover')
+    const legacyOptions = !menu.querySelector('[role="listbox"]') && !menu.classList.contains('date-picker-popover') && !menu.classList.contains('calendar-overflow-popover')
     const popoverId = binding.instance.popoverId
     const closeMenu = binding.value.close
     announceThemedPopover(popoverId)
@@ -72,7 +95,7 @@ const FloatingMenuPositioner = {
         bounds.top = Math.max(bounds.top, rect.top + 8)
         bounds.bottom = Math.min(bounds.bottom, rect.bottom - 8)
       }
-      const position = floatingMenuPosition(anchor, bounds, Math.max(anchor.width, minimumWidth), Math.min(menu.scrollHeight + 2, preferredHeight))
+      const position = floatingMenuPosition(anchor, bounds, floatingMenuWidth(anchor.width, minimumWidth, matchTriggerWidth), Math.min(menu.scrollHeight + 2, preferredHeight))
       const nextStyle = {
         left: `${position.left}px`, top: `${position.top}px`,
         width: `${position.width}px`, maxHeight: `${position.maxHeight}px`,
@@ -81,6 +104,8 @@ const FloatingMenuPositioner = {
       for (const [key, value] of Object.entries(nextStyle)) {
         if (menu.style[key] !== value) menu.style[key] = value
       }
+      if (matchTriggerWidth && position.width < 118) menu.classList.add('compact-trigger-menu')
+      else menu.classList.remove('compact-trigger-menu')
       menu.dataset.placement = position.opensAbove ? 'top' : 'bottom'
       if (legacyOptions) {
         menu.id = popoverId
@@ -142,6 +167,7 @@ const FloatingMenuPositioner = {
       window.removeEventListener('yd-themed-popover-open', closeOnPeer)
       if (legacyOptions) trigger.setAttribute('aria-expanded', 'false')
       menu.classList.remove('floating-menu-layer')
+      menu.classList.remove('compact-trigger-menu')
       if (originalStyle === null) menu.removeAttribute('style')
       else menu.setAttribute('style', originalStyle)
       delete menu.dataset.placement
@@ -171,6 +197,45 @@ const FloatingMenu = {
   updated() { FloatingMenuPositioner.updated(this.$refs.menu) },
   beforeUnmount() { FloatingMenuPositioner.beforeUnmount(this.$refs.menu) },
   template: `<span ref="anchor" class="floating-menu-anchor" aria-hidden="true"></span><Teleport to="body"><div class="app-shell floating-menu-root" :data-theme="$root.theme"><div ref="menu" v-bind="$attrs"><slot /></div></div></Teleport>`,
+}
+
+/* A shared portal keeps the day preview outside the rolling month's clipping area. */
+function createCalendarOverflow(FloatingMenu) {
+  return {
+    components: { FloatingMenu },
+    props: { day: String, events: { type: Array, default: () => [] }, limit: { type: Number, default: 2 } },
+    emits: ['select', 'edit'],
+    data() { return { open: false, closeTimer: null }; },
+    mounted() {
+      this.outside = event => {
+        if (!this.$el.contains(event.target) && !this.$refs.popup?.$refs.menu?.contains(event.target)) this.close();
+      };
+      document.addEventListener('pointerdown', this.outside);
+    },
+    beforeUnmount() { this.cancelClose(); document.removeEventListener('pointerdown', this.outside); },
+    methods: {
+      cancelClose() { clearTimeout(this.closeTimer); this.closeTimer = null; },
+      show() { this.cancelClose(); this.open = true; },
+      close() { this.cancelClose(); this.open = false; },
+      deferClose() {
+        this.cancelClose();
+        this.closeTimer = setTimeout(() => {
+          if (!this.$el.contains(document.activeElement) && !this.$refs.popup?.$refs.menu?.contains(document.activeElement)) this.close();
+        }, 200);
+      },
+      select() { this.show(); this.$emit('select', this.day); },
+      edit(event) { this.close(); this.$emit('edit', event); },
+      status(event) { return event.isCancelled ? '已取消' : event.isCompleted ? '已完成' : '待完成'; },
+      focusMenu() { this.show(); this.$nextTick(() => this.$refs.popup?.$refs.menu?.querySelector('button')?.focus()); },
+    },
+    template: `<div class="calendar-overflow" @click.stop @mouseenter="show" @mouseleave="deferClose" @focusout="deferClose">
+      <button class="calendar-more" aria-haspopup="dialog" :aria-expanded="open" :aria-label="day+'，另有'+(events.length-limit)+'项，查看当天全部日程'" @click="select" @keydown.down.prevent="focusMenu">+{{ events.length-limit }} 项</button>
+      <floating-menu v-if="open" ref="popup" class="calendar-overflow-popover" role="dialog" :aria-label="day+'的全部日程'" @close="close" @mouseenter="cancelClose" @mouseleave="deferClose" @focusout="deferClose">
+        <header><div><strong>{{ day }}</strong><small>当天共 {{ events.length }} 项日程</small></div><button class="calendar-preview-close" aria-label="关闭当天日程预览" @click="close">×</button></header>
+        <div class="calendar-preview-list"><button v-for="event in events" :key="event.id" class="calendar-preview-event" :class="[event.kind,{done:event.isCompleted,cancelled:event.isCancelled}]" @click="edit(event)"><time>{{ event.plannedTime || '全天' }}</time><div><b>{{ event.title }}</b><small>{{ status(event) }}</small></div></button></div>
+      </floating-menu>
+    </div>`,
+  };
 }
 
 const ThemedSelect = {
@@ -280,6 +345,100 @@ const ThemedSelect = {
         <div :id="popoverId" class="themed-select-options" role="listbox" :aria-label="label">
         <button v-for="(option, optionIndex) in visibleOptions" ref="optionButtons" :key="String(option.value)" type="button" role="option" :tabindex="optionIndex === activeIndex ? 0 : -1" :aria-selected="String(option === selectedOption)" :class="{ selected: option === selectedOption, focused: optionIndex === activeIndex }" @focus="activeIndex = optionIndex" @click="select(option)" @keydown.down.prevent="moveActive(1)" @keydown.up.prevent="moveActive(-1)" @keydown.home.prevent="moveTo(0)" @keydown.end.prevent="moveTo(visibleOptions.length - 1)" @keydown.enter.prevent="select(option)" @keydown.space.prevent="select(option)" @keydown.esc.prevent.stop="close(true)"><span><b>{{ option.label }}</b><small v-if="option.detail">{{ option.detail }}</small></span><i>✓</i></button>
         <p v-if="searchable && !visibleOptions.length" class="themed-select-empty">没有匹配的选项</p>
+        </div>
+      </floating-menu>
+    </div>
+  `,
+}
+
+const GroupedOwnerSelect = {
+  components: { FloatingMenu },
+  props: {
+    modelValue: { type: [String, Number], default: '' },
+    label: { type: String, default: '负责人' },
+    business: { type: Array, default: () => [] },
+    technical: { type: Array, default: () => [] },
+  },
+  emits: ['update:modelValue'],
+  data() {
+    return { open: false, popoverId: nextThemedPopoverId('owner') }
+  },
+  computed: {
+    businessOptions() { return this.uniqueEmployees(this.business) },
+    technicalOptions() { return this.uniqueEmployees(this.technical) },
+    selectedKey() { return String(this.modelValue || '') },
+    selectedLabel() {
+      if (!this.selectedKey) return '全部负责人'
+      const [role, id] = this.selectedKey.split(':')
+      const group = role === 'technical' ? this.technicalOptions : this.businessOptions
+      const employee = group.find(item => String(item.id) === id)
+      if (!employee) return '全部负责人'
+      return `${role === 'technical' ? '技术' : '商务'} · ${employee.display_name}`
+    },
+  },
+  mounted() {
+    this.closeOnDocumentClick = () => { this.open = false }
+    this.closeOnEscape = event => { if (event.key === 'Escape' && this.open) this.close(true) }
+    this.closeOnPeerOpen = event => { if (event.detail !== this.popoverId) this.open = false }
+    document.addEventListener('click', this.closeOnDocumentClick)
+    window.addEventListener('keydown', this.closeOnEscape)
+    window.addEventListener('yd-themed-popover-open', this.closeOnPeerOpen)
+  },
+  beforeUnmount() {
+    document.removeEventListener('click', this.closeOnDocumentClick)
+    window.removeEventListener('keydown', this.closeOnEscape)
+    window.removeEventListener('yd-themed-popover-open', this.closeOnPeerOpen)
+  },
+  methods: {
+    uniqueEmployees(employees) {
+      return employees.filter((employee, index, list) => list.findIndex(item => String(item.id) === String(employee.id)) === index)
+    },
+    toggle() {
+      if (this.open) return this.close()
+      this.openMenu()
+    },
+    openMenu() {
+      announceThemedPopover(this.popoverId)
+      this.open = true
+      nextTick(() => {
+        if (!this.selectedKey) return this.$refs.allOption?.focus()
+        const [role, id] = this.selectedKey.split(':')
+        const employees = role === 'technical' ? this.technicalOptions : this.businessOptions
+        const buttons = role === 'technical' ? this.$refs.technicalButtons : this.$refs.businessButtons
+        buttons?.[employees.findIndex(item => String(item.id) === id)]?.focus()
+      })
+    },
+    close(restoreFocus = false) {
+      this.open = false
+      if (restoreFocus) nextTick(() => this.$refs.trigger?.focus())
+    },
+    select(value) {
+      this.$emit('update:modelValue', value)
+      this.close(true)
+    },
+    employeeKey(role, employee) { return `${role}:${employee.id}` },
+  },
+  template: `
+    <div class="custom-select-field themed-select-field grouped-owner-select" @click.stop>
+      <span>{{ label }}</span>
+      <button ref="trigger" type="button" class="custom-select-trigger" :class="{ active: open }" :aria-label="label" :aria-expanded="String(open)" :aria-controls="popoverId" aria-haspopup="listbox" @click="toggle" @keydown.down.prevent="openMenu"><b>{{ selectedLabel }}</b><i></i></button>
+      <floating-menu v-if="open" :owner-id="popoverId" @close="close(true)" class="custom-select-menu themed-select-menu grouped-owner-menu" @keydown.tab="close()">
+        <div :id="popoverId" class="grouped-owner-options" role="listbox" :aria-label="label">
+          <button ref="allOption" type="button" role="option" class="grouped-owner-all" :class="{ selected: !selectedKey }" :aria-selected="String(!selectedKey)" @click="select('')"><span><b>全部负责人</b></span><i>✓</i></button>
+          <section class="grouped-owner-group business" role="group" aria-label="商务负责人">
+            <header><span><i></i>商务负责人</span><b>{{ businessOptions.length }} 人</b></header>
+            <div class="grouped-owner-scroll" tabindex="0" aria-label="商务负责人列表">
+              <button v-for="employee in businessOptions" ref="businessButtons" :key="employee.id" type="button" role="option" :class="{ selected: selectedKey === employeeKey('business', employee) }" :aria-selected="String(selectedKey === employeeKey('business', employee))" @click="select(employeeKey('business', employee))"><span><b>{{ employee.display_name }}</b></span><i>✓</i></button>
+              <p v-if="!businessOptions.length">暂无商务人员</p>
+            </div>
+          </section>
+          <section class="grouped-owner-group technical" role="group" aria-label="技术负责人">
+            <header><span><i></i>技术负责人</span><b>{{ technicalOptions.length }} 人</b></header>
+            <div class="grouped-owner-scroll" tabindex="0" aria-label="技术负责人列表">
+              <button v-for="employee in technicalOptions" ref="technicalButtons" :key="employee.id" type="button" role="option" :class="{ selected: selectedKey === employeeKey('technical', employee) }" :aria-selected="String(selectedKey === employeeKey('technical', employee))" @click="select(employeeKey('technical', employee))"><span><b>{{ employee.display_name }}</b></span><i>✓</i></button>
+              <p v-if="!technicalOptions.length">暂无技术人员</p>
+            </div>
+          </section>
         </div>
       </floating-menu>
     </div>
@@ -424,12 +583,12 @@ const ThemedDatePicker = {
 
 createApp({
   mixins: [typeof PersonalWork !== 'undefined' ? PersonalWork : {}],
-  components: { ThemedSelect, ThemedDatePicker, FloatingMenu },
+  components: { ThemedSelect, ThemedDatePicker, FloatingMenu, GroupedOwnerSelect, CalendarOverflow: createCalendarOverflow(FloatingMenu) },
   data() {
     const allowedPages = ['overview', 'customers', 'heatmap', 'followups', 'updates', 'visitors', 'plans']
     const hashPage = window.location.hash.replace(/^#\/?/, '').split('?')[0]
     return {
-      theme: localStorage.getItem('yd-theme') || 'minimal',
+      theme: readThemePreference(),
       activePage: allowedPages.includes(hashPage) ? hashPage : 'overview',
       customerPool: 'active',
       savedCustomerId: null,
@@ -440,6 +599,7 @@ createApp({
       sourceFilter: 'all',
       projectTypeFilter: 'all',
       progressFilter: 'all',
+      ownerAssignmentFilter: 'all',
       provinceFilter: 'all',
       cityFilter: 'all',
       dateFrom: '',
@@ -541,6 +701,7 @@ createApp({
       expandedProgressUpdateId: null,
       customerFollowUpsLoading: false,
       customerFollowUpsError: '',
+      customerDetailRequestId: 0,
       customerProjects: [],
       projectTypes: [],
       projectTypesCanManage: false,
@@ -636,7 +797,7 @@ createApp({
       metrics: [
         { label: '有效客资总览', value: '0', change: 'A 0 · B 0 · C 0', note: '等待读取真实客资数据', icon: '客', tone: 'blue', trend: 1, action: 'customers-summary' },
         { label: '每日进度更新', value: '0', change: '近 7 天', note: '暂无项目进度更新', icon: '更', tone: 'orange', trend: 0, action: 'progress-updates' },
-        { label: '实施中项目', value: '0', change: '占 0%', note: '当前处于项目实施跟进阶段', icon: '施', tone: 'green', trend: 1, action: 'construction' },
+        { label: 'A/B 责任人待分配', value: '0', change: '商务 0 · 技术 0', note: '仅统计 A、B 类有效客资', icon: '责', tone: 'green', trend: 1, action: 'owner-assignment' },
       ],
       overviewStats: null,
       overviewLoading: false,
@@ -936,18 +1097,17 @@ createApp({
     },
     filteredCustomers() {
       return this.customerPoolCustomers.filter(item => this.customerMatchesCurrentFilters(item)).sort((left, right) => {
-        if (left.id === this.savedCustomerId) return -1
-        if (right.id === this.savedCustomerId) return 1
-        const leftTime = Date.parse(left.updatedAt || left.createdAt || left.createdDate || '') || 0
-        const rightTime = Date.parse(right.updatedAt || right.createdAt || right.createdDate || '') || 0
+        const leftTime = Date.parse(left.createdAt || left.createdDate || '') || 0
+        const rightTime = Date.parse(right.createdAt || right.createdDate || '') || 0
         return rightTime - leftTime || Number(right.id || 0) - Number(left.id || 0)
       })
     },
     provinceOptions() {
       const counts = new Map()
       this.customerPoolCustomers.forEach(customer => {
-        const province = customer.country ? '' : this.locationParts(customer).province
-        if (!province.includes('待完善')) counts.set(province, (counts.get(province) || 0) + 1)
+        if (customer.country) return
+        const province = this.locationParts(customer).province
+        if (province && !province.includes('待完善')) counts.set(province, (counts.get(province) || 0) + 1)
       })
       return [...counts.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
     },
@@ -988,6 +1148,16 @@ createApp({
         value: stage,
         label: stage,
         count: this.customerPoolCustomers.filter(customer => customer.progress === stage).length,
+      }))
+    },
+    ownerAssignmentFilterOptions() {
+      return [
+        { value: 'incomplete', label: '责任人待分配' },
+        { value: 'business', label: '商务待分配' },
+        { value: 'technical', label: '技术待分配' },
+      ].map(option => ({
+        ...option,
+        count: this.customerPoolCustomers.filter(customer => this.customerMatchesOwnerAssignment(customer, option.value)).length,
       }))
     },
     editProvinceOptions() {
@@ -1292,7 +1462,7 @@ createApp({
     trendChart() {
       const rawBuckets = this.overviewStats?.customers?.trendBuckets
       const buckets = Array.isArray(rawBuckets) ? rawBuckets : []
-      const lineClasses = ['line-main', 'line-second', 'line-fourth', 'line-third']
+      const lineClasses = ['line-main', 'line-second', 'line-fourth', 'line-third', 'line-fifth']
       const sources = CUSTOMER_SOURCES.map((name, index) => ({
         name,
         className: lineClasses[index % lineClasses.length],
@@ -1488,8 +1658,9 @@ createApp({
   },
   methods: {
     setTheme(theme) {
+      if (!VALID_THEMES.includes(theme)) return
       this.theme = theme
-      localStorage.setItem('yd-theme', theme)
+      try { localStorage.setItem(THEME_PREFERENCE_KEY, theme) } catch (_) { /* Keep the current-page choice usable. */ }
       nextTick(() => this.renderMap())
     },
     handleMetric(metric) {
@@ -1497,15 +1668,16 @@ createApp({
       if (metric.action === 'progress-updates') this.openProgressUpdates()
       if (metric.action === 'followups') this.switchPage('followups')
       if (metric.action === 'done') this.openCustomerList({ progress: 'done' })
-      if (metric.action === 'construction') this.openCustomerList({ progress: 'construction' })
+      if (metric.action === 'owner-assignment') this.openCustomerList({ ownerAssignment: 'incomplete' })
     },
-    openCustomerList({ grade = 'all', source = 'all', projectType = 'all', progress = 'all', province = 'all', city = 'all' } = {}) {
+    openCustomerList({ grade = 'all', source = 'all', projectType = 'all', progress = 'all', ownerAssignment = 'all', province = 'all', city = 'all' } = {}) {
       this.customerPool = 'active'
       this.keyword = ''
       this.customerGrade = grade
       this.sourceFilter = source
       this.projectTypeFilter = String(projectType)
       this.progressFilter = progress
+      this.ownerAssignmentFilter = ownerAssignment
       this.provinceFilter = province
       this.cityFilter = city
       this.dateFrom = ''
@@ -1525,6 +1697,22 @@ createApp({
         && String(project.projectType?.id || '') === targetId
       )) || String(customer.projectTypeId || '') === targetId
     },
+    isCustomerOwnerMissing(customer, role) {
+      const isTechnical = role === 'technical'
+      const ownerId = isTechnical ? customer.techId : customer.ownerId
+      const ownerName = String((isTechnical ? customer.tech : customer.owner) || '').trim()
+      return !ownerId && (!ownerName || ownerName === '待分配')
+    },
+    customerMatchesOwnerAssignment(customer, filter = this.ownerAssignmentFilter) {
+      if (!filter || filter === 'all') return true
+      if (!['A', 'B'].includes(String(customer.grade || '').toUpperCase())) return false
+      const businessMissing = this.isCustomerOwnerMissing(customer, 'business')
+      const technicalMissing = this.isCustomerOwnerMissing(customer, 'technical')
+      if (filter === 'business') return businessMissing
+      if (filter === 'technical') return technicalMissing
+      if (filter === 'incomplete') return businessMissing || technicalMissing
+      return true
+    },
     customerMatchesCurrentFilters(item) {
       const word = this.keyword.trim().toLowerCase()
       const matchesWord = !word || [item.name, item.phone, item.region, item.projectName, item.plan, item.description].some(value => String(value || '').toLowerCase().includes(word))
@@ -1532,13 +1720,14 @@ createApp({
       const matchesSource = this.sourceFilter === 'all' || item.source === this.sourceFilter
       const matchesProjectType = this.projectTypeFilter === 'all' || this.customerHasProjectType(item, this.projectTypeFilter)
       const matchesProgress = this.progressFilter === 'all' || item.progress === this.progressFilter
+      const matchesOwnerAssignment = this.customerMatchesOwnerAssignment(item)
       const location = this.locationParts(item)
       const matchesProvince = this.provinceFilter === 'all' || location.province === this.provinceFilter
       const matchesCity = this.cityFilter === 'all' || location.city === this.cityFilter
       const createdDate = item.createdDate || String(item.createdAt || '').slice(0, 10)
       const matchesDateFrom = !this.dateFrom || (createdDate && createdDate >= this.dateFrom)
       const matchesDateTo = !this.dateTo || (createdDate && createdDate <= this.dateTo)
-      return matchesWord && matchesGrade && matchesSource && matchesProjectType && matchesProgress && matchesProvince && matchesCity && matchesDateFrom && matchesDateTo
+      return matchesWord && matchesGrade && matchesSource && matchesProjectType && matchesProgress && matchesOwnerAssignment && matchesProvince && matchesCity && matchesDateFrom && matchesDateTo
     },
     openDormantCustomerPool() {
       this.customerPool = this.customerPool === 'dormant' ? 'active' : 'dormant'
@@ -1601,7 +1790,11 @@ createApp({
           if (this.mapGrade !== 'all') params.set('grade', this.mapGrade)
           if (this.mapFilters.signed) params.set('signed', this.mapFilters.signed)
           if (this.mapFilters.progress) params.set('progress', this.mapFilters.progress)
-          if (this.mapFilters.ownerId) params.set('ownerId', this.mapFilters.ownerId)
+          if (this.mapFilters.ownerId) {
+            const [ownerRole, ownerId] = String(this.mapFilters.ownerId).split(':')
+            params.set('ownerId', ownerId || ownerRole)
+            if (ownerId && ['business', 'technical'].includes(ownerRole)) params.set('ownerRole', ownerRole)
+          }
           if (this.mapFilters.dateFrom) params.set('dateFrom', this.mapFilters.dateFrom)
           if (this.mapFilters.dateTo) params.set('dateTo', this.mapFilters.dateTo)
         } else {
@@ -1657,6 +1850,48 @@ createApp({
         province,
       })
     },
+    escapeMapTooltip(value) {
+      return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+    },
+    mapTooltipCount(value) {
+      if (value === '' || value == null) return null
+      const count = Number(value)
+      return Number.isFinite(count) && count >= 0 ? count : null
+    },
+    mapTooltipPosition(point, params, dom, rect, size) {
+      const gap = 14
+      const viewport = size?.viewSize || [0, 0]
+      const content = size?.contentSize || [272, 210]
+      const chartRect = dom?.parentElement?.getBoundingClientRect?.()
+      const screenWidth = typeof window === 'undefined' ? viewport[0] : window.innerWidth
+      const screenHeight = typeof window === 'undefined' ? viewport[1] : window.innerHeight
+      const minX = chartRect ? Math.max(8, 8 - chartRect.left) : 8
+      const minY = chartRect ? Math.max(8, 8 - chartRect.top) : 8
+      const maxX = Math.max(minX, Math.min(viewport[0] - content[0] - 8, chartRect ? screenWidth - chartRect.left - content[0] - 8 : viewport[0] - content[0] - 8))
+      const maxY = Math.max(minY, Math.min(viewport[1] - content[1] - 8, chartRect ? screenHeight - chartRect.top - content[1] - 8 : viewport[1] - content[1] - 8))
+      const preferredX = point[0] + gap + content[0] <= maxX + content[0] ? point[0] + gap : point[0] - content[0] - gap
+      const preferredY = point[1] + gap + content[1] <= maxY + content[1] ? point[1] + gap : point[1] - content[1] - gap
+      return [Math.min(Math.max(minX, preferredX), maxX), Math.min(Math.max(minY, preferredY), maxY)]
+    },
+    mapTooltipFormatter(params) {
+      const data = params?.data || {}
+      const regionName = this.escapeMapTooltip(params?.name || '未知地区')
+      const renderCount = value => {
+        const count = this.mapTooltipCount(value)
+        return count == null ? '<span class="map-tooltip-missing">暂无数据</span>' : String(count)
+      }
+      if (this.mapView === 'agents') {
+        return `<section class="regional-map-tooltip agent-map-tooltip"><header><strong>${regionName}</strong><span>代理覆盖</span></header><div class="map-tooltip-agent-grid"><div><span>授权项目</span><b>${renderCount(data.authorizationCount)}</b></div><div><span>独家授权</span><b>${renderCount(data.exclusiveCount)}</b></div></div><footer><span>区域客资</span><b>${renderCount(data.customerCount)}</b></footer></section>`
+      }
+      const totalCount = data.hasCustomerCount === false ? null : this.mapTooltipCount(data.customerCount ?? params?.value)
+      const grades = data.grades || {}
+      return `<section class="regional-map-tooltip customer-map-tooltip"><header><strong>${regionName}</strong><span>区域客资</span></header><div class="map-tooltip-total"><b>${totalCount == null ? '<span class="map-tooltip-missing">暂无数据</span>' : totalCount}</b>${totalCount == null ? '' : '<span>条客资</span>'}</div><div class="map-tooltip-grades"><div class="grade-a"><span>A级</span><b>${renderCount(grades.A)}</b></div><div class="grade-b"><span>B级</span><b>${renderCount(grades.B)}</b></div><div class="grade-c"><span>C级</span><b>${renderCount(grades.C)}</b></div></div><footer><span>签约客户</span><b>${renderCount(data.signedCount)}</b></footer></section>`
+    },
     async renderMap() {
       if (this.activePage !== 'heatmap' || !this.$refs.mapEl || typeof echarts === 'undefined') return
       try {
@@ -1672,29 +1907,46 @@ createApp({
         const accent = styles.getPropertyValue('--accent').trim()
         const card = styles.getPropertyValue('--card').trim()
         const soft = styles.getPropertyValue('--soft').trim()
-        const border = styles.getPropertyValue('--border').trim()
         const text = styles.getPropertyValue('--text').trim()
+        const muted = styles.getPropertyValue('--muted').trim()
+        const mapOutline = styles.getPropertyValue('--map-outline').trim() || muted || '#71827c'
         const max = Math.max(1, ...this.mapRegions.map(item => this.mapView === 'customers' ? Number(item.count || 0) : Number(item.authorizationCount || 0)))
         const agentColors = { active: '#198f63', partial: '#79b997', expiring: '#e6a23c', expired: '#d75a5a', inactive: '#a7b1ad', none: soft }
         const mapData = this.mapRegions.map(item => ({
           name: item.name,
-          value: this.mapView === 'customers' ? Number(item.count || 0) : Number(item.authorizationCount || 0),
+          value: this.mapView === 'customers' ? (this.mapTooltipCount(item.count) ?? 0) : (this.mapTooltipCount(item.authorizationCount) ?? 0),
           coverageStatus: item.coverageStatus || 'none',
-          authorizationCount: item.authorizationCount || 0,
-          exclusiveCount: item.exclusiveCount || 0,
-          grades: item.grades || {},
-          signedCount: item.signedCount || 0,
+          authorizationCount: this.mapTooltipCount(item.authorizationCount),
+          exclusiveCount: this.mapTooltipCount(item.exclusiveCount),
+          customerCount: this.mapTooltipCount(item.count),
+          hasCustomerCount: this.mapTooltipCount(item.count) != null,
+          grades: {
+            A: this.mapTooltipCount(item.grades?.A),
+            B: this.mapTooltipCount(item.grades?.B),
+            C: this.mapTooltipCount(item.grades?.C),
+          },
+          signedCount: this.mapTooltipCount(item.signedCount),
           itemStyle: this.mapView === 'agents' ? { areaColor: agentColors[item.coverageStatus] || soft } : undefined,
         }))
         this.mapChart.setOption({
-          tooltip: { trigger: 'item', backgroundColor: card, borderColor: border, textStyle: { color: text }, formatter: params => {
-            const data = params.data || {}
-            if (this.mapView === 'agents') return `${params.name}<br/><b style="font-size:16px">${data.authorizationCount || 0}</b> 项授权 · ${data.exclusiveCount || 0} 项独家<br/>区域客资 ${data.value == null ? 0 : (this.mapRegions.find(item => item.name === params.name)?.count || 0)} 条`
-            return `${params.name}<br/><b style="font-size:18px">${params.value || 0}</b> 条客资<br/>A ${data.grades?.A || 0} · B ${data.grades?.B || 0} · C ${data.grades?.C || 0}<br/>签约客户 ${data.signedCount || 0}`
-          } },
-          visualMap: this.mapView === 'customers' ? { show: true, min: 0, max, left: 24, bottom: 24, text: ['高', '低'], calculable: false, textStyle: { color: text }, inRange: { color: [soft, accent] } } : { show: false },
-          series: [{ type: 'map', map: 'china-customers', roam: true, zoom: 1.12, scaleLimit: { min: .9, max: 4 }, label: { show: false }, itemStyle: { areaColor: soft, borderColor: card, borderWidth: 1.3 }, emphasis: { label: { show: true, color: text, fontWeight: 700 }, itemStyle: { shadowBlur: 12, shadowColor: `${accent}66` } }, data: mapData }],
+          tooltip: {
+            trigger: 'item', renderMode: 'html', appendToBody: false, confine: true,
+            enterable: false, transitionDuration: .12, backgroundColor: card || '#fff',
+            borderWidth: 0, padding: 0, extraCssText: 'box-shadow:none;border-radius:13px;max-width:calc(100% - 16px);',
+            position: this.mapTooltipPosition,
+            formatter: params => this.mapTooltipFormatter(params),
+          },
+          geo: { id: 'china-outline', map: 'china-customers', silent: true, roam: false, zoom: 1.12, zlevel: 0, z: 1, label: { show: false }, tooltip: { show: false }, itemStyle: { areaColor: mapOutline, borderColor: mapOutline, borderWidth: 4 }, emphasis: { disabled: true } },
+          visualMap: this.mapView === 'customers' ? { show: true, min: 0, max, seriesIndex: 0, left: 24, bottom: 24, text: ['高', '低'], calculable: false, textStyle: { color: text }, inRange: { color: [soft, accent] } } : { show: false },
+          series: [{ id: 'china-data', type: 'map', map: 'china-customers', roam: true, zoom: 1.12, zlevel: 1, z: 2, scaleLimit: { min: .9, max: 4 }, label: { show: false }, itemStyle: { areaColor: soft, borderColor: card, borderWidth: 1.2 }, emphasis: { label: { show: true, color: text, fontWeight: 700 }, itemStyle: { borderColor: card, borderWidth: 1.4, shadowBlur: 10, shadowColor: accent } }, data: mapData }],
         }, true)
+        this.mapChart.off('georoam')
+        this.mapChart.on('georoam', params => {
+          if (params.seriesId !== 'china-data') return
+          const dataSeries = this.mapChart.getOption().series?.find(series => series.id === 'china-data')
+          if (!dataSeries) return
+          this.mapChart.setOption({ geo: { id: 'china-outline', center: dataSeries.center, zoom: dataSeries.zoom } })
+        })
         this.mapChart.off('click')
         this.mapChart.on('click', params => {
           const province = this.resolveMapProvince(params.name) || params.name
@@ -1727,6 +1979,7 @@ createApp({
         sourceFilter: this.sourceFilter,
         projectTypeFilter: this.projectTypeFilter,
         progressFilter: this.progressFilter,
+        ownerAssignmentFilter: this.ownerAssignmentFilter,
         provinceFilter: this.provinceFilter,
         cityFilter: this.cityFilter,
         dateFrom: this.dateFrom,
@@ -1742,7 +1995,7 @@ createApp({
     restoreCustomerEditReturnContext(savedCustomer, savedProject, context = this.customerEditReturnContext) {
       const target = context || { page: 'customers', customerPool: 'active', scrollY: 0 }
       const page = ['overview', 'customers', 'heatmap', 'followups', 'updates', 'visitors', 'plans'].includes(target.page) ? target.page : 'customers'
-      for (const key of ['keyword', 'customerGrade', 'sourceFilter', 'projectTypeFilter', 'progressFilter', 'provinceFilter', 'cityFilter', 'dateFrom', 'dateTo']) {
+      for (const key of ['keyword', 'customerGrade', 'sourceFilter', 'projectTypeFilter', 'progressFilter', 'ownerAssignmentFilter', 'provinceFilter', 'cityFilter', 'dateFrom', 'dateTo']) {
         if (target[key] !== undefined) this[key] = target[key]
       }
       this.customerPool = target.customerPool === 'dormant' ? 'dormant' : 'active'
@@ -1774,7 +2027,13 @@ createApp({
 
       this.$nextTick(() => {
         const element = visible && elementId ? document.getElementById(elementId) : null
-        if (element) element.scrollIntoView({ block: 'start', behavior: 'smooth' })
+        if (page === 'customers') {
+          const restoreScroll = () => {
+            if (typeof window !== 'undefined' && Number.isFinite(target.scrollY)) window.scrollTo(0, target.scrollY)
+          }
+          if (typeof requestAnimationFrame === 'function') requestAnimationFrame(restoreScroll)
+          else restoreScroll()
+        } else if (element) element.scrollIntoView({ block: 'start', behavior: 'smooth' })
         else if (typeof window !== 'undefined' && Number.isFinite(target.scrollY)) window.scrollTo({ top: target.scrollY })
         if (page === 'heatmap') this.loadRegionalMap()
         if (page === 'overview') this.loadOverviewStatistics()
@@ -1787,6 +2046,7 @@ createApp({
       this.sourceFilter = 'all'
       this.projectTypeFilter = 'all'
       this.progressFilter = 'all'
+      this.ownerAssignmentFilter = 'all'
       this.provinceFilter = 'all'
       this.cityFilter = 'all'
       this.dateFrom = ''
@@ -1883,7 +2143,7 @@ createApp({
       this.overviewLoading = true
       this.overviewError = ''
       try {
-        const response = await fetch('/api/statistics/overview/')
+        const response = await fetch('/api/statistics/overview/', { cache: 'no-store' })
         const data = await response.json()
         if (!response.ok) throw new Error(data.error || `经营总览加载失败（${response.status}）`)
         if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('经营总览数据格式不正确')
@@ -1891,7 +2151,6 @@ createApp({
         const customerStats = data.customers && typeof data.customers === 'object' ? data.customers : {}
         const rawGradeCounts = customerStats.gradeCounts
         const gradeCounts = rawGradeCounts && typeof rawGradeCounts === 'object' && !Array.isArray(rawGradeCounts) ? rawGradeCounts : { A: 0, B: 0, C: 0 }
-        const projectStats = data.projects && typeof data.projects === 'object' ? data.projects : {}
         const progressUpdateStats = data.progressUpdates && typeof data.progressUpdates === 'object' ? data.progressUpdates : {}
         this.metrics[0].value = String(customerStats.total || 0)
         this.metrics[0].change = `A ${gradeCounts.A || 0} · B ${gradeCounts.B || 0} · C ${gradeCounts.C || 0}`
@@ -1901,13 +2160,14 @@ createApp({
         this.metrics[1].note = progressUpdateStats.last7Days
           ? `近 7 天共有 ${progressUpdateStats.last7Days} 条实际项目进展`
           : '近 7 天暂无项目进展记录'
-        const activeProjects = Number(projectStats.active || 0)
-        const implementationProjects = Number(projectStats.implementation || 0)
-        this.metrics[2].value = String(implementationProjects)
-        this.metrics[2].change = activeProjects
-          ? `占在办 ${Math.round(implementationProjects / activeProjects * 100)}%`
-          : '占在办 0%'
-        this.metrics[2].note = `项目共 ${projectStats.total || 0} 个 · 在办 ${activeProjects} 个 · 已完成 ${projectStats.completed || 0} 个`
+        const rawOwnerAssignments = customerStats.ownerAssignments
+        const ownerAssignments = rawOwnerAssignments && typeof rawOwnerAssignments === 'object' && !Array.isArray(rawOwnerAssignments) ? rawOwnerAssignments : {}
+        const incompleteOwners = Number(ownerAssignments.incomplete || 0)
+        this.metrics[2].value = String(incompleteOwners)
+        this.metrics[2].change = `商务 ${Number(ownerAssignments.businessMissing || 0)} · 技术 ${Number(ownerAssignments.technicalMissing || 0)}`
+        this.metrics[2].note = incompleteOwners
+          ? `共 ${incompleteOwners} 条 A/B 类客资需要补充负责人`
+          : 'A/B 类客资负责人均已完善'
       } catch (error) {
         this.overviewError = error.message || '经营总览加载失败'
         this.showToast(this.overviewError)
@@ -3404,6 +3664,8 @@ createApp({
     },
     async loadCustomerFollowUps(customerId, projectId = this.selectedCustomerProjectId, options = {}) {
       if (!customerId) return
+      const requestId = (this.customerDetailRequestId || 0) + 1
+      this.customerDetailRequestId = requestId
       const preserveEditSnapshot = Boolean(options.preserveEditSnapshot)
       const preserveStageExpansion = Boolean(options.preserveStageExpansion)
       const openingDraft = JSON.stringify(this.editCustomer)
@@ -3411,11 +3673,14 @@ createApp({
       this.customerFollowUpsError = ''
       try {
         const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''
-        const response = await fetch(`/api/customers/${customerId}/${query}`)
+        const response = await fetch(`/api/customers/${customerId}/${query}`, { cache: 'no-store', credentials: 'same-origin' })
+        if (response.redirected && /\/login\//.test(response.url || '')) throw new Error('登录已失效，请重新登录后保存')
+        const contentType = response.headers?.get('content-type')
+        if (contentType && !contentType.includes('application/json')) throw new Error(`项目资料读取失败（${response.status}），请重试`)
         const data = await response.json()
         if (!response.ok) throw new Error(data.error || `阶段事项加载失败（${response.status}）`)
         const activeCustomer = this.customers[this.editingIndex]
-        if (!activeCustomer || activeCustomer.id !== customerId) return
+        if (requestId !== this.customerDetailRequestId || !activeCustomer || activeCustomer.id !== customerId) return
         this.customerFollowUps = Array.isArray(data.followUps) ? data.followUps : []
         this.customerProgressUpdates = Array.isArray(data.progressUpdates) ? data.progressUpdates : []
         this.customerVisitorRecords = Array.isArray(data.visitorRecords) ? data.visitorRecords : []
@@ -3455,9 +3720,11 @@ createApp({
         }
         if (!preserveEditSnapshot && draftUnchanged) this.editSnapshot = JSON.stringify(this.editCustomer)
       } catch (error) {
-        this.customerFollowUpsError = error.message || '阶段事项加载失败'
+        if (requestId === this.customerDetailRequestId && this.customers[this.editingIndex]?.id === customerId) {
+          this.customerFollowUpsError = error.message || '阶段事项加载失败'
+        }
       } finally {
-        this.customerFollowUpsLoading = false
+        if (requestId === this.customerDetailRequestId) this.customerFollowUpsLoading = false
       }
     },
     setCustomerLocationMode(target, mode) {
@@ -4233,6 +4500,8 @@ createApp({
     },
     closeCustomerEdit(options = {}) {
       const visitorReturnId = this.visitorDetailReturnRecordId
+      this.customerDetailRequestId = (this.customerDetailRequestId || 0) + 1
+      this.customerFollowUpsLoading = false
       if (this.actionConfirm.open) this.resolveActionConfirm(false)
       this.closeFollowTaskEditor()
       this.closeFollowTaskDelete()
@@ -4336,7 +4605,21 @@ createApp({
     async saveCustomerEdit(options = {}) {
       if (this.savingEdit) return false
       if (this.customerFollowUpsLoading) { this.showToast('项目资料仍在加载，请稍后保存'); return false }
-      if (this.customerFollowUpsError) { this.showToast('项目资料加载失败，请重新打开客资后再保存'); return false }
+      if (this.customerFollowUpsError) {
+        const customerId = this.customers[this.editingIndex]?.id
+        if (!customerId) return false
+        this.savingEdit = true
+        try {
+          await this.loadCustomerFollowUps(customerId, this.selectedCustomerProjectId, { preserveEditSnapshot: true, preserveStageExpansion: true })
+        } finally {
+          this.savingEdit = false
+        }
+        if (this.customers[this.editingIndex]?.id !== customerId) return false
+        if (this.customerFollowUpsError) {
+          this.showToast(`暂未保存：${this.customerFollowUpsError}`)
+          return false
+        }
+      }
       const keepOpen = Boolean(options.keepOpen)
       this.showUnsavedConfirm = false
       if (this.editingIndex < 0 || !this.customers[this.editingIndex]) return false

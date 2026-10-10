@@ -1925,6 +1925,18 @@ def overview_statistics(request):
         .order_by('-count', 'province')
     )
     missing_region_count = customers.filter(country='', province='').count()
+    owner_required_customers = customers.filter(grade__in=FOLLOW_UP_CUSTOMER_GRADES)
+    business_owner_missing = Q(business_owner__isnull=True) & (
+        Q(business_owner_name='') | Q(business_owner_name='待分配')
+    )
+    technical_owner_missing = Q(technical_owner__isnull=True) & (
+        Q(technical_owner_name='') | Q(technical_owner_name='待分配')
+    )
+    owner_assignment_counts = {
+        'incomplete': owner_required_customers.filter(business_owner_missing | technical_owner_missing).count(),
+        'businessMissing': owner_required_customers.filter(business_owner_missing).count(),
+        'technicalMissing': owner_required_customers.filter(technical_owner_missing).count(),
+    }
 
     projects = Project.objects.filter(customer__in=customers).select_related('project_type')
     project_type_counts = list(
@@ -2012,6 +2024,7 @@ def overview_statistics(request):
             ],
             'missingRegionCount': missing_region_count,
             'overseasCount': customers.exclude(country='').count(),
+            'ownerAssignments': owner_assignment_counts,
         },
         'projects': {
             'total': projects.count(),
@@ -3499,6 +3512,7 @@ def filtered_map_customers(request):
     progress = request.GET.get('progress', '').strip()
     signed = request.GET.get('signed', '').strip()
     owner_id = request.GET.get('ownerId', '').strip()
+    owner_role = request.GET.get('ownerRole', '').strip()
     date_from = parse_date(request.GET.get('dateFrom', ''))
     date_to = parse_date(request.GET.get('dateTo', ''))
     if province:
@@ -3518,7 +3532,12 @@ def filtered_map_customers(request):
         )
         customers = customers.filter(signed_query) if signed == 'true' else customers.exclude(signed_query)
     if owner_id.isdigit():
-        customers = customers.filter(Q(business_owner_id=owner_id) | Q(technical_owner_id=owner_id))
+        if owner_role == 'business':
+            customers = customers.filter(business_owner_id=owner_id)
+        elif owner_role == 'technical':
+            customers = customers.filter(technical_owner_id=owner_id)
+        else:
+            customers = customers.filter(Q(business_owner_id=owner_id) | Q(technical_owner_id=owner_id))
     if date_from:
         customers = customers.filter(created_at__date__gte=date_from)
     if date_to:

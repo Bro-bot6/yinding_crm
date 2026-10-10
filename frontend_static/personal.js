@@ -27,10 +27,8 @@ const PersonalWork = (() => {
     computed: {
       visiblePersonalProjects() {
         return this.personalProjects.filter(p => this.personalProjectMatchesFilters(p)).sort((a, b) => {
-          if (a.id === this.savedProjectId) return -1;
-          if (b.id === this.savedProjectId) return 1;
           const grade = this.personalSort === 'priority' ? 'ABCD'.indexOf(a.customer.grade) - 'ABCD'.indexOf(b.customer.grade) : 0;
-          return grade || (b.latestFollowupAt ? Date.parse(b.latestFollowupAt) : 0) - (a.latestFollowupAt ? Date.parse(a.latestFollowupAt) : 0) || a.id - b.id;
+          return grade || this.personalActivityTime(b) - this.personalActivityTime(a) || a.id - b.id;
         });
       },
       calendarDays() {
@@ -63,6 +61,9 @@ const PersonalWork = (() => {
         return [...this.calendarItems].filter(e => e.plannedDate.slice(0, 7) === this.calendarDate.slice(0, 7)).sort(eventOrder);
       },
       calendarSelectedEvents() { return this.eventsOn(this.calendarDate); },
+      calendarSelectedLabel() { return new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: 'long', day: 'numeric' }).format(dateAt(this.calendarDate)); },
+      calendarSelectedWeekday() { return new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', weekday: 'long' }).format(dateAt(this.calendarDate)); },
+      calendarPendingCount() { return this.calendarSelectedEvents.filter(event => !event.isCompleted && !event.isCancelled).length; },
       calendarCustomerOptions() {
         return [{ value: '', label: '不关联客户' }, ...this.customers.map(c => ({ value: c.id, label: c.name }))];
       },
@@ -86,6 +87,18 @@ const PersonalWork = (() => {
       showEdit(value) { if (!value) this.loadPersonalProjects(); },
     },
     methods: {
+      personalActivityTime(project) {
+        return Math.max(0, ...[
+          project.latestActivityAt, project.updatedAt, project.createdAt,
+          project.customer?.updatedAt, project.customer?.createdAt, project.latestFollowupAt,
+        ].map(value => Date.parse(value) || 0));
+      },
+      onPersonalProjectClick(event, project) {
+        if (event.defaultPrevented || event.target.closest('button, a, input, select, textarea, [role="button"], [contenteditable="true"]')) return;
+        // Selecting description text should not unexpectedly open the editor.
+        if (typeof window !== 'undefined' && window.getSelection()?.toString()) return;
+        return this.openPersonalProject(project);
+      },
       personalProjectMatchesFilters(project) {
         const f = this.personalFilters;
         const search = (this.personalSearch || this.keyword || '').trim().toLowerCase();
@@ -111,7 +124,7 @@ const PersonalWork = (() => {
         const request = ++this.personalRequest;
         this.personalLoading = true;
         try {
-          const response = await fetch('/api/my-projects/' + (this.personalEmployee ? '?employee=' + encodeURIComponent(this.personalEmployee) : ''));
+          const response = await fetch('/api/my-projects/' + (this.personalEmployee ? '?employee=' + encodeURIComponent(this.personalEmployee) : ''), { cache: 'no-store' });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || '我的客资加载失败');
           if (request !== this.personalRequest) return;
@@ -133,7 +146,8 @@ const PersonalWork = (() => {
         if (calendar) calendar.badge = this.calendarTodayCount ? this.calendarTodayCount + '项' : '';
       },
       async openPersonalProject(project) {
-        if (!this.customers.some(c => c.id === project.customer.id) || !this.customerProjects.some(p => p.id === project.id)) await this.loadCustomers();
+        await this.loadCustomers();
+        if (this.customerLoadError) return;
         if (!this.customerProjects.some(p => p.id === project.id && p.customer.id === project.customer.id)) return this.showToast('当前无法访问该项目，请刷新后重试');
         const customer = this.customers.find(c => c.id === project.customer.id);
         if (!customer) return this.showToast('当前无法访问该客户，请刷新后重试');

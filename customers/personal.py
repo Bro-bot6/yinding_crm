@@ -3,12 +3,13 @@ from datetime import datetime, time, timedelta
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required
-from django.db.models import OuterRef, Q, Subquery
+from django.db.models import Max, OuterRef, Q, Subquery
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_time
 from django.views.decorators.http import require_GET, require_http_methods
+from django.views.decorators.cache import never_cache
 
 from .models import EmployeeProfile, Project, ProjectProgressUpdate, TomorrowItem
 from .views import accessible_customers, employee_display_name, parse_payload, serialize_project
@@ -27,6 +28,7 @@ def owned_projects(user):
 
 @login_required
 @require_GET
+@never_cache
 def my_projects(request):
     employee = request.user
     if request.GET.get('employee'):
@@ -42,6 +44,8 @@ def my_projects(request):
     ).annotate(
         latest_followup_at=Subquery(latest.values('occurred_at')[:1]),
         latest_followup_content=Subquery(latest.values('content')[:1]),
+        latest_followup_updated_at=Max('progress_updates__updated_at'),
+        latest_followup_created_at=Max('progress_updates__created_at'),
     ).order_by('id')
     items = []
     for project in projects:
@@ -49,6 +53,14 @@ def my_projects(request):
         item['customer']['description'] = project.customer.description
         item['latestFollowupAt'] = project.latest_followup_at.isoformat() if project.latest_followup_at else ''
         item['latestFollowupContent'] = project.latest_followup_content or ''
+        # Editing customer/project details and backdated follow-ups also count
+        # as activity, without changing the actual follow-up summary or time.
+        item['latestActivityAt'] = max(value for value in (
+            project.customer.updated_at, project.updated_at,
+            project.customer.created_at, project.created_at,
+            project.latest_followup_at, project.latest_followup_updated_at,
+            project.latest_followup_created_at,
+        ) if value is not None).isoformat()
         items.append(item)
     employees = []
     if request.user.is_superuser:

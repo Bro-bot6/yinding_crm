@@ -81,6 +81,50 @@ class PersonalWorkTests(TestCase):
         self.assertIsNone(historic.due_at)
         self.assertEqual(self.project.follow_up_tasks.count(), 1)
 
+    def test_personal_activity_includes_customer_and_project_edits_without_followup(self):
+        previous = timezone.now() - timedelta(days=3)
+        Customer.objects.filter(pk=self.customer.pk).update(created_at=previous, updated_at=previous)
+        Project.objects.filter(pk=self.project.pk).update(created_at=previous, updated_at=previous)
+        for model, key in ((Customer, self.customer.pk), (Project, self.project.pk)):
+            with self.subTest(model=model.__name__):
+                changed = timezone.now()
+                model.objects.filter(pk=key).update(updated_at=changed)
+                response = self.client.get('/api/my-projects/')
+                item = response.json()['projects'][0]
+                self.assertEqual(item['latestActivityAt'], changed.isoformat())
+                self.assertEqual(item['latestFollowupAt'], '')
+                self.assertEqual(item['latestFollowupContent'], '')
+                self.assertIn('no-store', response['Cache-Control'])
+
+    def test_editing_backdated_followup_counts_without_replacing_latest_summary(self):
+        now = timezone.now()
+        older = ProjectProgressUpdate.objects.create(
+            project=self.project, content='历史沟通', occurred_at=now - timedelta(days=5), created_by=self.user,
+        )
+        newer = ProjectProgressUpdate.objects.create(
+            project=self.project, content='最近沟通', occurred_at=now - timedelta(days=1), created_by=self.user,
+        )
+        changed = timezone.now()
+        ProjectProgressUpdate.objects.filter(pk=older.pk).update(content='补充历史沟通', updated_at=changed)
+        item = self.client.get('/api/my-projects/').json()['projects'][0]
+        self.assertEqual(item['latestActivityAt'], changed.isoformat())
+        self.assertEqual(item['latestFollowupAt'], newer.occurred_at.isoformat())
+        self.assertEqual(item['latestFollowupContent'], '最近沟通')
+
+    def test_unrelated_sibling_project_updates_do_not_change_personal_activity(self):
+        before = self.client.get('/api/my-projects/').json()['projects'][0]['latestActivityAt']
+        self.sibling.plan = '其他负责人项目更新'
+        self.sibling.save()
+        ProjectProgressUpdate.objects.create(project=self.sibling, content='其他项目跟进', created_by=self.other)
+        item = self.client.get('/api/my-projects/').json()['projects'][0]
+        self.assertEqual(item['id'], self.project.id)
+        self.assertEqual(item['latestActivityAt'], before)
+
+    def test_new_project_without_followup_uses_creation_and_update_time(self):
+        item = self.client.get('/api/my-projects/').json()['projects'][0]
+        self.assertEqual(item['latestActivityAt'], max(self.customer.updated_at, self.project.updated_at).isoformat())
+        self.assertEqual(item['latestFollowupAt'], '')
+
     def test_historical_manual_items_remain_same_records(self):
         item = TomorrowItem.objects.create(user=self.user, title='原个人安排', note='原备注', planned_date=timezone.localdate(), is_completed=True, completed_at=timezone.now())
         data = self.client.get('/api/calendar/').json()

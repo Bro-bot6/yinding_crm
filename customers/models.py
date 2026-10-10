@@ -68,6 +68,7 @@ class Customer(models.Model):
         VIDEO_ACCOUNT = '视频号', '视频号'
         SERVICE_ACCOUNT = '服务号', '服务号'
         REFERRAL = '朋友介绍', '朋友介绍'
+        OTHER = '其他', '其他'
 
     class CooperationStatus(models.TextChoices):
         NONE = 'none', '未建立合作关系'

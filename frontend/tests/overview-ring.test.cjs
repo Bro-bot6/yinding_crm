@@ -54,7 +54,7 @@ test('客资与来访趋势的零值、刻度和填充基线一致', () => {
   }
 })
 
-test('客资来源统计和趋势固定包含四种来源，服务号使用独立视觉样式', () => {
+test('客资来源统计和趋势固定包含五种来源，其他使用独立视觉样式', () => {
   const overviewStats = {
     customers: {
       sourceCounts: [{ name: '服务号', count: 2 }],
@@ -62,11 +62,11 @@ test('客资来源统计和趋势固定包含四种来源，服务号使用独�
     },
   }
   const stats = app.computed.sourceStats.call({ overviewStats })
-  assert.deepEqual(Array.from(stats, item => item.name), ['抖音', '视频号', '服务号', '朋友介绍'])
-  assert.deepEqual(Array.from(stats, item => item.value), [0, 0, 2, 0])
+  assert.deepEqual(Array.from(stats, item => item.name), ['抖音', '视频号', '服务号', '朋友介绍', '其他'])
+  assert.deepEqual(Array.from(stats, item => item.value), [0, 0, 2, 0, 0])
   assert.equal(stats[2].className, 'service-account')
   const chart = app.computed.trendChart.call({ overviewStats })
-  assert.deepEqual(Array.from(chart.series, item => item.name), ['抖音', '视频号', '服务号', '朋友介绍'])
+  assert.deepEqual(Array.from(chart.series, item => item.name), ['抖音', '视频号', '服务号', '朋友介绍', '其他'])
   assert.equal(chart.series[2].className, 'line-fourth')
   assert.deepEqual(Array.from(chart.series[2].values), [2])
 })

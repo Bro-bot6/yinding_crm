@@ -111,12 +111,12 @@ test('新建客资提交是否添加微信状态', async () => {
   assert.equal(fixture.requests[0].payload.wechatStatus, 'yes')
 })
 
-test('所有可选客资来源入口统一为四种来源并包含服务号', () => {
+test('所有可选客资来源入口统一为五种来源并包含其他', () => {
   let app
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../../frontend_static/app.js'), 'utf8'), {
     Vue: { createApp(options) { app = options; return { mount() {} } }, nextTick() {} },
   })
-  const expected = ['抖音', '视频号', '服务号', '朋友介绍']
+  const expected = ['抖音', '视频号', '服务号', '朋友介绍', '其他']
   const optionValues = computed => Array.from(computed, item => item.value)
   assert.deepEqual(optionValues(app.computed.customerSourceSelectOptions.call({})), expected)
   assert.deepEqual(optionValues(app.computed.batchCustomerSourceOptions.call({})), expected)

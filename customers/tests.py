@@ -352,6 +352,10 @@ class OverviewStatisticsApiTests(TestCase):
         Customer.objects.filter(id=customers[1].id).update(
             created_at=self.aware_at(today - timedelta(days=4)),
         )
+        Customer.objects.filter(id=customers[2].id).update(
+            business_owner=None,
+            business_owner_name='待分配',
+        )
         Customer.objects.create(
             name='不进入有效统计的 D 客资', grade='D', source='抖音', province='江苏省',
         )
@@ -419,6 +423,11 @@ class OverviewStatisticsApiTests(TestCase):
             {'name': '江苏省', 'count': 1},
         ])
         self.assertEqual(payload['customers']['missingRegionCount'], 1)
+        self.assertEqual(payload['customers']['ownerAssignments'], {
+            'incomplete': 3,
+            'businessMissing': 0,
+            'technicalMissing': 3,
+        })
         self.assertEqual(payload['projects']['total'], 4)
         self.assertEqual(payload['projects']['active'], 3)
         self.assertEqual(payload['projects']['completed'], 1)
@@ -1183,7 +1192,7 @@ class CustomerPersistenceApiTests(TestCase):
             data=json.dumps({
                 'name': self.customer.name,
                 'phone': self.customer.phone,
-                'source': '其他',
+                'source': '未知来源',
                 'province': self.customer.province,
                 'city': self.customer.city,
                 'district': self.customer.district,
@@ -1194,19 +1203,19 @@ class CustomerPersistenceApiTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn('抖音、视频号、服务号、朋友介绍', response.json()['error'])
+        self.assertIn('抖音、视频号、服务号、朋友介绍、其他', response.json()['error'])
         self.customer.refresh_from_db()
         self.assertEqual(self.customer.source, Customer.Source.DOUYIN)
 
     def test_legacy_source_can_be_preserved_during_an_unrelated_edit(self):
-        self.customer.source = '其他'
+        self.customer.source = '历史渠道'
         self.customer.save(update_fields=('source',))
         response = self.client.patch(
             reverse('customer-detail', args=[self.customer.id]),
             data=json.dumps({
                 'name': '历史来源名称已修改',
                 'phone': self.customer.phone,
-                'source': '其他',
+                'source': '历史渠道',
                 'province': self.customer.province,
                 'city': self.customer.city,
                 'district': self.customer.district,
@@ -1221,7 +1230,33 @@ class CustomerPersistenceApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.customer.refresh_from_db()
         self.assertEqual(self.customer.name, '历史来源名称已修改')
-        self.assertEqual(self.customer.source, '其他')
+        self.assertEqual(self.customer.source, '历史渠道')
+
+    def test_other_source_is_persisted_and_returned(self):
+        response = self.client.patch(
+            reverse('customer-detail', args=[self.customer.id]),
+            data=json.dumps({
+                'name': self.customer.name,
+                'phone': self.customer.phone,
+                'source': '其他',
+                'province': self.customer.province,
+                'city': self.customer.city,
+                'district': self.customer.district,
+                'grade': self.customer.grade,
+                'cooperationStatus': 'none',
+                'description': '',
+                'progress': '需求对接',
+                'plan': '原方案',
+                'ownerId': self.business.id,
+                'techId': self.technical.id,
+            }),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.source, Customer.Source.OTHER)
+        self.assertEqual(response.json()['customer']['source'], '其他')
 
     def test_batch_lead_creation_accepts_qq_contact(self):
         response = self.client.post(
@@ -2384,6 +2419,34 @@ class PartnershipAgencyContractAndMapApiTests(TestCase):
         self.assertEqual(payload['regions'][0]['name'], '浙江省')
         self.assertEqual(payload['authorizations'][0]['city'], '杭州市')
         self.assertEqual(payload['authorizations'][0]['customerId'], self.zhejiang.id)
+
+    def test_customer_map_owner_filter_distinguishes_business_and_technical_roles(self):
+        dual_role = get_user_model().objects.create_user(
+            username='dual-role-owner', password='123456',
+        )
+        EmployeeProfile.objects.create(
+            user=dual_role, role=EmployeeProfile.Role.BOTH, nickname='兼任负责人',
+        )
+        self.zhejiang.business_owner = dual_role
+        self.zhejiang.save(update_fields=['business_owner'])
+        self.jiangsu.technical_owner = dual_role
+        self.jiangsu.save(update_fields=['technical_owner'])
+
+        business_response = self.client.get(
+            reverse('regional-business-map'),
+            {'view': 'customers', 'ownerId': dual_role.id, 'ownerRole': 'business'},
+        )
+        technical_response = self.client.get(
+            reverse('regional-business-map'),
+            {'view': 'customers', 'ownerId': dual_role.id, 'ownerRole': 'technical'},
+        )
+
+        self.assertEqual(business_response.status_code, 200)
+        self.assertEqual(technical_response.status_code, 200)
+        self.assertEqual(business_response.json()['total'], 1)
+        self.assertEqual(business_response.json()['regions'][0]['name'], '浙江省')
+        self.assertEqual(technical_response.json()['total'], 1)
+        self.assertEqual(technical_response.json()['regions'][0]['name'], '江苏省')
 
     def test_contract_has_independent_status_and_sixty_day_reminder(self):
         response = self.client.post(

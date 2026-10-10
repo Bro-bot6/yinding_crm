@@ -44,7 +44,7 @@ if '--prepare' in sys.argv:
         if grade in 'AB':
             ProjectProgressUpdate.objects.get_or_create(project=project, content='已确认客户需求，准备资料并安排下次沟通', defaults={'occurred_at': timezone.now() - timedelta(days=i), 'created_by': user})
     for i in range(5):
-        TomorrowItem.objects.get_or_create(user=user, title='隔离日程' + str(i + 1), defaults={
+        TomorrowItem.objects.update_or_create(user=user, title='隔离日程' + str(i + 1), defaults={
             'planned_date': timezone.localdate(), 'planned_time': '14:00' if i % 2 else None,
             'kind': ['personal', 'appointment', 'project'][i % 3], 'note': '仅用于界面验证',
         })

@@ -33,13 +33,57 @@ test('进行中与已完成按真实项目状态切换且保留筛选排序', ()
   assert.equal(i.visiblePersonalProjects.map(p => p.id).join(','), '2');
   assert.equal(i.personalSort, 'recent');
 });
-test('我的客资修改后若仍符合筛选则置于当前结果首项', () => {
+test('保存高亮不覆盖等级和最近更新排序', () => {
   const { instance: i } = setup();
   i.personalProjects = [project(1, 'A', '2026-09-07'), project(2, 'C', '2026-08-01')];
   i.savedProjectId = 2;
-  assert.equal(i.visiblePersonalProjects.map(p => p.id).join(','), '2,1');
+  assert.equal(i.visiblePersonalProjects.map(p => p.id).join(','), '1,2');
   i.personalFilters.grade = 'A';
   assert.equal(i.visiblePersonalProjects.map(p => p.id).join(','), '1');
+});
+test('资料和项目更新也进入排序，同等级最近更新优先', () => {
+  const { instance: i } = setup();
+  i.personalProjects = [project(1, 'A', '2026-09-19'), project(2, 'B', ''), project(3, 'B', '2026-09-20')];
+  i.personalProjects[1].latestActivityAt = '2026-09-21T10:00:00+08:00';
+  assert.equal(i.visiblePersonalProjects.map(p => p.id).join(','), '1,2,3');
+  i.personalSort = 'recent';
+  assert.equal(i.visiblePersonalProjects.map(p => p.id).join(','), '2,3,1');
+});
+test('无跟进使用真实创建时间，非法或缺失时间排序保持稳定', () => {
+  const { instance: i } = setup();
+  i.personalSort = 'recent';
+  i.personalProjects = [project(3, 'B', ''), project(2, 'B', ''), project(1, 'B', '')];
+  i.personalProjects[0].createdAt = '2026-09-21';
+  i.personalProjects[1].latestActivityAt = 'invalid';
+  assert.equal(i.visiblePersonalProjects.map(p => p.id).join(','), '3,1,2');
+});
+test('卡片主体点击打开对应项目，内部操作和选中文本不误触', async () => {
+  let opens = 0;
+  const selected = {text:''};
+  const {instance:i} = setup({window:{getSelection:()=>({toString:()=>selected.text})}});
+  const record = project(7,'B','');
+  i.openPersonalProject = async p => { assert.equal(p.id,7); opens++; };
+  await i.onPersonalProjectClick({target:{closest:()=>null}}, record);
+  assert.equal(opens,1);
+  await i.onPersonalProjectClick({target:{closest:()=>({tagName:'BUTTON'})}}, record);
+  selected.text='选中客户描述';
+  await i.onPersonalProjectClick({target:{closest:()=>null}}, record);
+  assert.equal(opens,1);
+});
+test('进入我的客资刷新且请求禁用缓存，详情刷新后定位同客户的正确项目', async () => {
+  let loads=0, opened;
+  const {instance:i,options} = setup({fetch:async(url,opts)=>{
+    assert.equal(url,'/api/my-projects/'); assert.equal(opts.cache,'no-store');
+    return {ok:true,json:async()=>({projects:[project(7,'B','')],employees:[]})};
+  }});
+  await i.loadPersonalProjects(); assert.equal(i.personalProjects[0].id,7);
+  i.loadPersonalProjects=()=>{loads++;};
+  options.watch.activePage.call(i,'followups'); assert.equal(loads,1);
+  i.customers=[{id:7,name:'旧名称'}];i.customerProjects=[{id:9,customer:{id:7}}];
+  i.loadCustomers=async()=>{i.customers=[{id:7,name:'新名称'}];};
+  i.openCustomerEdit=(customer,id)=>{opened={customer,id};};
+  await i.openPersonalProject({id:9,customer:{id:7}});
+  assert.equal(opened.customer.name,'新名称'); assert.equal(opened.id,9);
 });
 test('搜索联系方式并组合来源地区进度筛选', () => {
   const { instance: i } = setup();
@@ -137,6 +181,12 @@ test('我的客资卡片直接复用全部客资的正常卡片样式', () => {
   assert.match(html, /grade-block-/);
   assert.doesNotMatch(html, /personal-project-field/);
   assert.doesNotMatch(css, /\.personal-project-field\s*\{/);
+});
+test('我的客资客户名称和联系方式均可点击复制', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../../frontend/personal_pages.html'), 'utf8');
+  assert.match(html, /copyCustomerField\(project\.customer\.name, '客户名称'\)/);
+  assert.match(html, /copyCustomerField\(project\.customer\.phone, '联系方式'\)/);
+  assert.equal((html.match(/class="record-copy record-copy-(?:name|phone)"/g) || []).length, 2);
 });
 test('疑似重复需确认，取消后不继续保存', async () => {
   let question;

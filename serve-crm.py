@@ -5,9 +5,10 @@ import os
 import secrets
 import socket
 import sys
-from ipaddress import ip_address, ip_network
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+from config.local_hosts import active_lan_ipv4
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -51,38 +52,10 @@ def ensure_standard_streams() -> None:
 
 
 def discover_lan_ip() -> str:
-    candidates: list[str] = []
-    try:
-        candidates.extend(socket.gethostbyname_ex(socket.gethostname())[2])
-    except OSError:
-        pass
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(('192.168.1.1', 9))
-            candidates.append(sock.getsockname()[0])
-    except OSError:
-        pass
-    unique_candidates = list(dict.fromkeys(
-        address for address in candidates
-        if address and not address.startswith(('127.', '169.254.'))
-    ))
-    preferred_networks = (
-        ip_network('192.168.0.0/16'),
-        ip_network('10.0.0.0/8'),
-        ip_network('172.16.0.0/12'),
-    )
-    # VPN/代理软件常创建 198.18.0.0/15 等虚拟网卡，系统解析顺序并不稳定。
-    # 优先选择 RFC1918 局域网地址，避免重启后将虚拟网卡写入 ALLOWED_HOSTS。
-    for network in preferred_networks:
-        for address in unique_candidates:
-            try:
-                if ip_address(address) in network:
-                    return address
-            except ValueError:
-                continue
-    if unique_candidates:
-        return unique_candidates[0]
-    return '127.0.0.1'
+    active_addresses = active_lan_ipv4(refresh=True)
+    # At boot Wi-Fi may not be ready. The middleware will recognize its IP
+    # when it appears; never publish a proxy tunnel as the colleague URL.
+    return active_addresses[0] if active_addresses else '127.0.0.1'
 
 
 def load_secret_key() -> str:
@@ -111,6 +84,7 @@ def configure_environment(lan_ip: str) -> None:
     os.environ.setdefault('DJANGO_SECRET_KEY', load_secret_key())
     os.environ.setdefault('DJANGO_DATA_DIR', str(DATA_DIR))
     os.environ.setdefault('DJANGO_ALLOWED_HOSTS', ','.join(sorted(allowed_hosts)))
+    os.environ.setdefault('DJANGO_AUTO_LOCAL_HOSTS', '1')
 
 
 def configure_logging() -> None:

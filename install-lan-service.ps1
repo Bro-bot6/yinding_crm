@@ -9,7 +9,7 @@ if ($LASTEXITCODE -eq 0 -and $gitCommonDir) {
 }
 $pythonw = Join-Path $sharedRoot '.venv\Scripts\pythonw.exe'
 $serverScript = Join-Path $projectDir 'serve-crm.py'
-$backupScript = Join-Path $projectDir 'backup-crm.pyw'
+$backupScript = Join-Path $sharedRoot 'archive-crm.pyw'
 $monitorScript = Join-Path $projectDir 'monitor-crm.ps1'
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
@@ -50,9 +50,9 @@ Register-ScheduledTask `
 
 $dailyBackupAction = New-ScheduledTaskAction `
     -Execute $pythonw `
-    -Argument ('"{0}"' -f $backupScript) `
+    -Argument ('"{0}" --code-dir "{1}"' -f $backupScript, $projectDir) `
     -WorkingDirectory $projectDir
-$backupTrigger = New-ScheduledTaskTrigger -Daily -At '21:00'
+$backupTrigger = New-ScheduledTaskTrigger -Daily -At '17:30'
 $backupSettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -62,7 +62,7 @@ $backupSettings = New-ScheduledTaskSettingsSet `
 
 Register-ScheduledTask `
     -TaskName 'YindingCRMBackup' `
-    -Description 'Daily CRM database backup and Excel customer export.' `
+    -Description 'Daily CRM database and Excel archive at 17:30; stored in E:\yinding_crm\backups\daily.' `
     -Action $dailyBackupAction `
     -Trigger $backupTrigger `
     -Settings $backupSettings `

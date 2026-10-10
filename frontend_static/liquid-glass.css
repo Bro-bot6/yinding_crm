@@ -1,0 +1,193 @@
+/* Shared materials: themes change tokens only, never geometry or business content. */
+.app-shell {
+  --bg: #edf1f8; --card: #fdfdff; --soft: #f1f4fa; --text: #202d43; --muted: #61718a;
+  --accent: #5865d9; --accent-text: #424eb7; --accent-soft: #e9edfc; --on-accent: #fff;
+  --border: rgba(91,111,149,.16); --glass-edge: rgba(255,255,255,.72);
+  --glass-glint: rgba(255,255,255,.74); --glass-shade: rgba(70,88,126,.08);
+  --glass-surface: rgba(255,255,255,.76); --glass-raised: rgba(249,251,255,.91);
+  --glass-nav: rgba(249,251,255,.72); --glass-calendar: rgba(255,255,255,.65);
+  --glass-input: rgba(243,247,253,.83); --glass-hover: rgba(255,255,255,.62);
+  --ambient-a: rgba(146,168,232,.20); --ambient-b: rgba(172,204,228,.18); --ambient-c: rgba(201,184,229,.14);
+  --shadow: 0 10px 30px rgba(28,47,79,.055);
+  --glass-shadow: 0 10px 30px rgba(28,47,79,.065), inset 0 1px 0 var(--glass-glint), inset 0 -1px 0 var(--glass-shade);
+  --glass-float-shadow: 0 18px 50px rgba(28,47,79,.16), inset 0 1px 0 var(--glass-glint), inset 0 -1px 0 var(--glass-shade);
+  --calendar-line: rgba(98,121,147,.105); --festival-ink: #95611a; --festival-surface: rgba(237,199,122,.18);
+  --event-personal: #8773ca; --event-appointment: #259f8f; --event-project: #388fce;
+  --glass-ease: cubic-bezier(.2,.8,.2,1);
+}
+.app-shell[data-theme="fresh"] {
+  --bg: #edf4ef; --card: #fcfefc; --soft: #eff6f2; --text: #183930; --muted: #5e7970;
+  --accent: #148965; --accent-text: #087557; --accent-soft: #e0f1e9;
+  --border: rgba(72,116,98,.16); --glass-edge: rgba(255,255,255,.69);
+  --glass-glint: rgba(255,255,255,.78); --glass-shade: rgba(43,99,76,.07);
+  --glass-surface: rgba(253,255,253,.76); --glass-raised: rgba(249,254,250,.92);
+  --glass-nav: rgba(248,253,249,.71); --glass-calendar: rgba(253,255,253,.65);
+  --glass-input: rgba(240,248,242,.85); --glass-hover: rgba(255,255,255,.59);
+  --ambient-a: rgba(111,176,145,.21); --ambient-b: rgba(169,200,176,.22); --ambient-c: rgba(222,213,160,.13);
+  --shadow: 0 10px 30px rgba(23,63,46,.055);
+  --glass-shadow: 0 10px 30px rgba(23,63,46,.065), inset 0 1px 0 var(--glass-glint), inset 0 -1px 0 var(--glass-shade);
+  --glass-float-shadow: 0 18px 50px rgba(23,63,46,.16), inset 0 1px 0 var(--glass-glint), inset 0 -1px 0 var(--glass-shade);
+  --calendar-line: rgba(69,117,93,.11);
+}
+.app-shell[data-theme="midnight"] {
+  --bg: #101c2e; --card: #182a40; --soft: #20354c; --text: #e6effa; --muted: #a1b5cc;
+  --accent: #56b6ed; --accent-text: #8dd4fb; --accent-soft: #25445e; --on-accent: #10263b;
+  --border: rgba(157,191,222,.19); --glass-edge: rgba(170,203,234,.20);
+  --glass-glint: rgba(201,226,252,.15); --glass-shade: rgba(0,7,20,.21);
+  --glass-surface: rgba(25,43,64,.84); --glass-raised: rgba(25,43,64,.94);
+  --glass-nav: rgba(18,34,54,.82); --glass-calendar: rgba(27,47,67,.76);
+  --glass-input: rgba(30,51,72,.93); --glass-hover: rgba(123,173,212,.10);
+  --ambient-a: rgba(66,105,158,.21); --ambient-b: rgba(45,124,133,.12); --ambient-c: rgba(81,87,143,.13);
+  --shadow: 0 10px 30px rgba(0,7,19,.16);
+  --glass-shadow: 0 10px 30px rgba(0,7,19,.18), inset 0 1px 0 var(--glass-glint), inset 0 -1px 0 var(--glass-shade);
+  --glass-float-shadow: 0 18px 50px rgba(0,7,19,.36), inset 0 1px 0 var(--glass-glint), inset 0 -1px 0 var(--glass-shade);
+  --calendar-line: rgba(166,199,224,.105); --festival-ink: #e9c47f; --festival-surface: rgba(182,141,55,.14);
+  --event-personal: #af9be9; --event-appointment: #62c5ac; --event-project: #66b7ed;
+}
+.app-shell:not(.floating-menu-root) {
+  background: radial-gradient(ellipse at 8% 12%,var(--ambient-a),transparent 48%), radial-gradient(ellipse at 95% 62%,var(--ambient-b),transparent 48%), radial-gradient(ellipse at 50% 100%,var(--ambient-c),transparent 45%),var(--bg);
+  background-attachment: fixed;
+}
+.app-shell .sidebar, .app-shell .topbar {
+  background: linear-gradient(125deg,var(--glass-glint),transparent 35%),var(--glass-nav);
+  border-color: var(--glass-edge); backdrop-filter: blur(22px) saturate(135%); -webkit-backdrop-filter: blur(22px) saturate(135%);
+  box-shadow: inset 0 1px 0 var(--glass-glint);
+}
+.app-shell .panel {
+  background: linear-gradient(130deg,color-mix(in srgb,var(--glass-glint) 28%,transparent),transparent 36%),var(--glass-surface);
+  border-color: var(--glass-edge); border-radius: 16px; box-shadow: var(--glass-shadow);
+}
+/* Dense data stays solid: no per-row blur and no texture behind long descriptions. */
+.app-shell .customer-record { background: var(--card); border-color: var(--border); box-shadow: var(--shadow); }
+.app-shell .record-details { background: color-mix(in srgb,var(--accent-soft) 66%,var(--card)); }
+.app-shell .record-project { background: var(--card); }
+.app-shell :is(.primary-btn,.ghost-btn,.calendar-navigation button,.personal-segment,.theme-switcher) {
+  border-radius: 11px; transition: background 140ms var(--glass-ease),box-shadow 140ms var(--glass-ease),transform 140ms var(--glass-ease);
+}
+.app-shell :is(.primary-btn,.personal-segment button.selected) {
+  color: var(--on-accent);
+  background: linear-gradient(180deg,rgba(255,255,255,.15),transparent 65%),var(--accent);
+  box-shadow: 0 4px 12px color-mix(in srgb,var(--accent) 18%,transparent),inset 0 1px 0 rgba(255,255,255,.26);
+}
+.app-shell .primary-btn:hover { transform: translateY(-1px); filter: brightness(1.035); box-shadow: 0 6px 16px color-mix(in srgb,var(--accent) 24%,transparent),inset 0 1px 0 rgba(255,255,255,.36); }
+.app-shell :is(.primary-btn,.ghost-btn,.calendar-navigation button):active { transform: scale(.98); }
+.app-shell :is(.ghost-btn,.calendar-navigation button,.personal-segment) { background: var(--glass-surface); border-color: var(--glass-edge); box-shadow: inset 0 1px 0 var(--glass-glint),0 2px 5px var(--glass-shade); }
+.app-shell :is(.custom-select-trigger,.themed-date-trigger,.calendar-detail input,.calendar-detail textarea) { background-color: var(--glass-input); border-color: var(--border); border-radius: 10px; }
+.app-shell :is(button,input,textarea):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.app-shell[data-theme] .floating-menu-layer {
+  background: linear-gradient(135deg,color-mix(in srgb,var(--glass-glint) 35%,transparent),transparent 38%),var(--glass-raised);
+  backdrop-filter: blur(28px) saturate(155%); -webkit-backdrop-filter: blur(28px) saturate(155%);
+  border: 1px solid var(--glass-edge); border-radius: 17px; box-shadow: var(--glass-float-shadow);
+  animation: glass-arrive 180ms var(--glass-ease); transform-origin: top left;
+}
+.app-shell[data-theme] .floating-menu-layer[data-placement="top"] { transform-origin: bottom left; }
+.app-shell :is(.create-modal,.edit-drawer,.action-confirm-modal) {
+  background: linear-gradient(135deg,color-mix(in srgb,var(--glass-glint) 28%,transparent),transparent 30%),var(--glass-raised);
+  backdrop-filter: blur(28px) saturate(145%); -webkit-backdrop-filter: blur(28px) saturate(145%);
+  border-color: var(--glass-edge); box-shadow: var(--glass-float-shadow); border-radius: 20px; animation: glass-arrive 240ms var(--glass-ease);
+}
+/* Editing dense customer data needs an opaque surface in every browser.
+   Keep the themed shadow while avoiding nested backdrop compositing. */
+.app-shell .edit-drawer,
+.app-shell .edit-drawer > header,
+.app-shell .edit-drawer > .edit-scroll,
+.app-shell .edit-drawer > footer {
+  background: var(--card);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.app-shell .edit-backdrop { padding: 20px 32px; }
+.app-shell .customer-edit-drawer {
+  width: min(1280px, calc(100vw - 64px)); max-width: 1280px;
+  height: min(920px, calc(100vh - 40px)); max-height: calc(100vh - 40px);
+  height: min(920px, calc(100dvh - 40px)); max-height: calc(100dvh - 40px);
+  min-width: 0;
+}
+.app-shell .customer-edit-drawer > .edit-scroll { overflow-x: hidden; overflow-y: auto; }
+@media (max-width: 600px) {
+  .app-shell .edit-backdrop { padding: 8px; }
+  .app-shell .customer-edit-drawer {
+    width: calc(100vw - 16px); max-width: 100%;
+    height: calc(100vh - 16px); max-height: calc(100vh - 16px);
+    height: calc(100dvh - 16px); max-height: calc(100dvh - 16px);
+  }
+}
+@keyframes glass-arrive { from { opacity: 0; transform: translateY(4px) scale(.985); } to { opacity: 1; transform: none; } }
+/* Calendar: a single refracting surface, fine internal lines, no individual cell blur. */
+.app-shell .calendar-board {
+  background: linear-gradient(135deg,color-mix(in srgb,var(--glass-glint) 25%,transparent),transparent 42%),var(--glass-calendar);
+  backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%); border-radius: 18px;
+}
+.calendar-board :is(.calendar-weekdays,.calendar-month-label) { background: transparent; border-color: var(--calendar-line); }
+.calendar-board .calendar-cell { border-color: var(--calendar-line); }
+.calendar-board .calendar-cell.empty { background: color-mix(in srgb,var(--soft) 35%,transparent); }
+.calendar-board .calendar-cell:not(.empty):hover { background: var(--glass-hover); }
+.calendar-board .calendar-cell.selected { background: color-mix(in srgb,var(--accent) 7%,transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb,var(--accent) 36%,transparent); }
+.calendar-board .calendar-cell.today { background: color-mix(in srgb,var(--accent) 5%,transparent); }
+.calendar-board .calendar-cell .calendar-day { background: transparent; color: var(--text); }
+.calendar-board .calendar-cell.selected .calendar-day { color: var(--accent-text); background: var(--accent-soft); }
+.calendar-board .calendar-cell.today .calendar-day { background: var(--accent); color: var(--on-accent); box-shadow: inset 0 1px 0 var(--glass-glint); }
+.app-shell[data-theme] .calendar-festival { color: var(--festival-ink); background: var(--festival-surface); border-radius: 6px; padding: 1px 5px; font-size: 10px; }
+.calendar-board .calendar-date-row { margin-bottom: 4px; }
+.calendar-event,.calendar-detail-item,.calendar-preview-event { --event-color: var(--event-personal); }
+.calendar-event.appointment,.calendar-detail-item.appointment,.calendar-preview-event.appointment { --event-color: var(--event-appointment); }
+.calendar-event.project,.calendar-detail-item.project,.calendar-preview-event.project { --event-color: var(--event-project); }
+.calendar-board .calendar-event { border: 0; border-radius: 6px; background: transparent; gap: 5px; padding: 3px 4px; min-height: 22px; }
+.calendar-board .calendar-event::before { content: ''; width: 6px; height: 6px; flex: 0 0 6px; background: var(--event-color); border-radius: 50%; box-shadow: inset 0 1px 0 rgba(255,255,255,.3); }
+.calendar-board .calendar-event:hover { background: color-mix(in srgb,var(--event-color) 12%,transparent); }
+.calendar-board .calendar-event span { font-size: 10px; color: var(--muted); }
+.calendar-board .calendar-event b { font-size: 12px; }
+.calendar-month .calendar-event span { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.calendar-more { color: var(--muted); padding: 3px 5px; border-radius: 6px; }
+.calendar-more:hover,.calendar-more[aria-expanded="true"] { background: var(--accent-soft); color: var(--accent-text); }
+.calendar-overflow { width: fit-content; }
+.app-shell .calendar-detail { background: linear-gradient(135deg,color-mix(in srgb,var(--glass-glint) 25%,transparent),transparent 44%),var(--glass-surface); }
+.calendar-day-summary { padding: 3px 0 18px; border-bottom: 1px solid var(--calendar-line); }
+.calendar-day-summary .kicker { font-size: 9px; margin: 0 0 9px; }
+.calendar-day-summary h2 { font-size: 21px; letter-spacing: -.5px; }
+.calendar-day-summary > div { display: flex; gap: 12px; align-items: center; margin-top: 9px; color: var(--muted); font-size: 12px; }
+.calendar-timeline-heading { margin: 18px 0 8px; }
+.calendar-timeline-heading small { display: block; color: var(--muted); font-size: 11px; margin-top: 5px; }
+.calendar-detail .calendar-detail-item { display: grid; grid-template-columns: 42px minmax(0,1fr); gap: 15px; border: 0; position: relative; padding: 13px 0 17px; }
+.calendar-timeline-time { color: var(--text); font-size: 12px; padding-top: 2px; font-weight: 600; }
+.calendar-timeline-content { position: relative; min-width: 0; padding-left: 15px; border-left: 1px solid var(--calendar-line); }
+.calendar-timeline-content::before { content: ''; position: absolute; left: -4px; top: 5px; width: 7px; height: 7px; border-radius: 50%; background: var(--event-color); }
+.calendar-timeline-content > small { color: var(--muted); font-size: 10px; }
+.calendar-timeline-content p { font-size: 12px; line-height: 1.65; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; margin: 7px 0; }
+.calendar-timeline-content .calendar-status { font-size: 10px; }
+.calendar-item-actions { gap: 12px; margin-top: 8px; }
+.calendar-item-actions button { font-size: 11px; }
+.calendar-detail-item.done h3 { text-decoration: line-through; }
+.calendar-empty-day { padding: 35px 5px; text-align: center; }
+.calendar-empty-day svg { width: 34px; height: 34px; stroke: var(--accent); stroke-width: 1.5; fill: none; margin-bottom: 12px; }
+.calendar-empty-day h3 { font-size: 13px; }
+.calendar-overflow-popover { --floating-min-width: 310; --floating-max-height: 380; padding: 14px; color: var(--text); }
+.calendar-overflow-popover header { display: flex; justify-content: space-between; align-items: center; padding: 2px 2px 12px; border-bottom: 1px solid var(--border); }
+.calendar-overflow-popover header strong { font-size: 15px; }
+.calendar-overflow-popover header small { display: block; font-size: 11px; color: var(--muted); margin-top: 5px; }
+.calendar-preview-close { border: 1px solid var(--border); border-radius: 9px; width: 28px; height: 28px; background: var(--glass-input); color: var(--text); font-size: 19px; cursor: pointer; }
+.calendar-preview-event { display: flex; width: 100%; align-items: baseline; gap: 12px; margin-top: 6px; padding: 10px 8px; border: 0; border-radius: 10px; background: transparent; text-align: left; color: var(--text); cursor: pointer; }
+.calendar-preview-event:hover { background: var(--glass-hover); }
+.calendar-preview-event time { flex: 0 0 38px; font-size: 11px; color: var(--muted); }
+.calendar-preview-event > div { min-width: 0; border-left: 3px solid var(--event-color); padding-left: 10px; }
+.calendar-preview-event b { font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.calendar-preview-event small { display: block; font-size: 10px; color: var(--muted); margin-top: 3px; }
+.calendar-preview-event.done b { text-decoration: line-through; }
+@media (max-width: 760px) {
+  .calendar-board .calendar-event { flex-direction: row; }
+  .calendar-board .calendar-event span { display: none; }
+  .calendar-board .calendar-event b { min-width: 0; }
+}
+@media (max-width: 560px) {
+  .app-shell[data-theme] .calendar-date-row .calendar-festival { font-size: 0; padding: 1px 2px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-shell *, .app-shell *::before { animation: none !important; transition: none !important; }
+  .app-shell .primary-btn:hover { transform: none; }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .app-shell[data-theme] { --glass-nav: var(--card); --glass-surface: var(--card); --glass-raised: var(--card); --glass-calendar: var(--card); }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .app-shell[data-theme] { --glass-nav: var(--card); --glass-surface: var(--card); --glass-raised: var(--card); --glass-calendar: var(--card); }
+}

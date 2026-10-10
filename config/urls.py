@@ -19,6 +19,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.views import LoginView, LogoutView
 from django.urls import path
 from django.views.generic import TemplateView
+from django.views.decorators.cache import never_cache
 from customers.views import (
     authorization_detail,
     available_employees,
@@ -108,7 +109,7 @@ urlpatterns = [
     path('api/tomorrow-items/<int:item_id>/', tomorrow_item_detail, name='tomorrow-item-detail'),
     path(
         '',
-        login_required(TemplateView.as_view(template_name='index.html')),
+        never_cache(login_required(TemplateView.as_view(template_name='index.html'))),
         name='home',
     ),
 ]
