@@ -15,6 +15,14 @@ PROGRESS_STAGES = (
     '售后维护与需求挖掘',
 )
 
+CUSTOMER_SOURCES = (
+    '抖音',
+    '视频号',
+    '服务号',
+    '朋友介绍',
+    '其他',
+)
+
 FOLLOW_UP_CUSTOMER_GRADES = ('A', 'B')
 
 LEGACY_PROGRESS_MAPPING = {

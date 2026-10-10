@@ -22,7 +22,7 @@ from .models import (
     TomorrowItem,
     VisitorRecord,
 )
-from .services import PROGRESS_STAGES, normalize_progress
+from .services import CUSTOMER_SOURCES, PROGRESS_STAGES, normalize_progress
 
 
 class ProjectTypeAndProgressUpdateApiTests(TestCase):
@@ -317,7 +317,7 @@ class SchemeCalculationApiTests(TestCase):
             ],
         }
 
-    def test_three_layer_calculation_is_saved_and_quantity_rounds_up(self):
+    def test_three_layer_calculation_rounds_combined_quantity_only_once(self):
         self.client.force_login(self.admin)
         response = self.client.put(
             reverse('scheme-calculation', args=(self.customer.id,)),
@@ -328,11 +328,38 @@ class SchemeCalculationApiTests(TestCase):
         result = response.json()['calculation']
         self.assertEqual(result['layerCount'], 3)
         self.assertEqual(len(result['layers']), 3)
-        self.assertEqual(result['layers'][0]['quantity'], 14)
-        self.assertEqual(result['layers'][0]['totalPrice'], 8400)
+        self.assertEqual(result['totalExactQuantity'], 32.64)
+        self.assertEqual(result['totalQuantity'], 33)
+        self.assertEqual(result['totalPrice'], 19800)
+        self.assertEqual([layer['quantity'] for layer in result['layers']], [13.75, 11, 8.25])
+        self.assertEqual(result['layers'][0]['totalPrice'], 8250)
         self.assertEqual(result['layers'][0]['mixDescription'], '10%土凝岩稳定土（PS-I）')
         self.assertEqual(result['remarks'], self.payload['remarks'])
         self.assertTrue(SchemeCalculation.objects.filter(project=self.project).exists())
+
+        stored = SchemeCalculation.objects.get(project=self.project)
+        self.assertNotIn('quantity', stored.layers[0])
+        read_result = self.client.get(
+            reverse('scheme-calculation', args=(self.customer.id,)),
+        ).json()['calculation']
+        self.assertEqual(read_result['totalQuantity'], 33)
+        self.assertEqual(read_result['totalPrice'], 19800)
+
+    def test_combined_quantity_is_proportionally_allocated_for_different_prices(self):
+        self.client.force_login(self.admin)
+        self.payload['layers'][1]['unitPrice'] = 650
+        self.payload['layers'][2]['unitPrice'] = 700
+        response = self.client.put(
+            reverse('scheme-calculation', args=(self.customer.id,)),
+            data=json.dumps(self.payload),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        result = response.json()['calculation']
+        self.assertEqual(result['totalQuantity'], 33)
+        self.assertEqual([layer['quantity'] for layer in result['layers']], [13.75, 11, 8.25])
+        self.assertEqual([layer['totalPrice'] for layer in result['layers']], [8250, 7150, 5775])
+        self.assertEqual(result['totalPrice'], 21175)
 
     def test_square_meter_price_uses_each_layers_actual_thickness(self):
         self.client.force_login(self.admin)
@@ -367,8 +394,11 @@ class SchemeCalculationApiTests(TestCase):
         self.assertGreater(len(response.content), 0)
         workbook = load_workbook(BytesIO(response.content))
         sheet = workbook.active
-        self.assertEqual(sheet['J12'].value, '土凝岩单平米报价（元/㎡）')
-        self.assertEqual(sheet.max_column, 12)
+        self.assertEqual(sheet['I12'].value, '密度（t/m³）')
+        self.assertEqual(sheet['K12'].value, '土凝岩单平米报价（元/㎡）')
+        self.assertEqual(sheet['L12'].value, '按总量比例分摊（吨）')
+        self.assertEqual(sheet['M12'].value, '分摊材料金额（元）')
+        self.assertEqual(sheet.max_column, 13)
         self.assertEqual(sheet.cell(row=18, column=1).value, '报价备注 / TERMS & NOTES')
         self.assertEqual(sheet.cell(row=19, column=1).value, 1)
         self.assertEqual(sheet.cell(row=19, column=2).value, self.payload['remarks'])
@@ -376,11 +406,29 @@ class SchemeCalculationApiTests(TestCase):
         self.assertEqual(sheet.cell(row=21, column=1).value, 3)
         self.assertIsNone(sheet.auto_filter.ref)
         self.assertEqual(sheet['A8'].value, '推荐掺量')
-        self.assertEqual(sheet['J8'].value, '材料总价')
-        self.assertEqual(sheet['J9'].value, '¥20,400.00')
+        self.assertEqual(sheet['K8'].value, '材料总价')
+        self.assertEqual(sheet['H8'].value, '合并取整总用量')
+        self.assertTrue(sheet['H9'].value.startswith('=ROUNDUP(SUMPRODUCT('))
+        self.assertEqual(sheet['K9'].value, '=SUM(M13:M15)')
+        self.assertEqual(sheet['D9'].number_format, '¥#,##0.00 /㎡')
+        self.assertEqual(sheet['H9'].number_format, '0 "吨"')
+        self.assertEqual(sheet['K9'].number_format, '¥#,##0.00')
         self.assertEqual(sheet['A9'].value, '10% + 8% + 6%')
-        self.assertEqual(sheet['D9'].value, '¥48.96 /㎡')
+        self.assertEqual(sheet['D9'].value, '=SUM(K13:K15)')
         self.assertEqual(sheet['D13'].value, '10%土凝岩稳定土（PS-I）')
+        self.assertEqual(sheet['I13'].value, 1.7)
+        self.assertEqual(sheet['K13'].value, '=ROUND(G13*H13*I13*J13,2)')
+        self.assertTrue(sheet['L13'].value.startswith('=IF(SUMPRODUCT('))
+        self.assertEqual(sheet['M13'].value, '=ROUND(L13*J13,2)')
+        self.assertEqual(sheet['M13'].number_format, '¥#,##0.00')
+        self.assertEqual(sheet['H16'].value, '10% + 8% + 6%')
+        self.assertEqual(sheet['H16'].font.sz, 9)
+        self.assertIn('H16:I16', {str(cell_range) for cell_range in sheet.merged_cells.ranges})
+        self.assertTrue(sheet['L16'].value.startswith('=ROUNDUP(SUMPRODUCT('))
+        self.assertEqual(sheet['M16'].value, '=SUM(M13:M15)')
+        self.assertTrue(workbook.calculation.fullCalcOnLoad)
+        self.assertTrue(workbook.calculation.forceFullCalc)
+        self.assertEqual(workbook.calculation.calcMode, 'auto')
         self.assertNotIn('说明：', ' '.join(
             str(cell.value or '') for row in sheet.iter_rows() for cell in row
         ))
@@ -660,17 +708,22 @@ class AvailableEmployeesApiTests(TestCase):
         self.assertIsNotNone(both_payload['businessLevel'])
         self.assertIsNotNone(both_payload['technicalLevel'])
 
-    def test_active_superuser_is_available_for_both_roles(self):
+    def test_superuser_is_not_available_as_customer_owner(self):
         superuser = get_user_model().objects.create_superuser(
             username='admin',
             password='test-password',
+        )
+        EmployeeProfile.objects.create(
+            user=superuser,
+            role=EmployeeProfile.Role.BOTH,
         )
 
         self.client.force_login(superuser)
         payload = self.client.get(reverse('available-employees')).json()
 
-        self.assertIn(superuser.id, {item['id'] for item in payload['business']})
-        self.assertIn(superuser.id, {item['id'] for item in payload['technical']})
+        self.assertNotIn(superuser.id, {item['id'] for item in payload['all']})
+        self.assertNotIn(superuser.id, {item['id'] for item in payload['business']})
+        self.assertNotIn(superuser.id, {item['id'] for item in payload['technical']})
 
     def test_anonymous_request_is_redirected_to_login(self):
         response = self.client.get(reverse('available-employees'))
@@ -890,6 +943,88 @@ class CustomerPersistenceApiTests(TestCase):
             any(project['customer']['id'] == self.customer.id for project in payload['projects']),
         )
 
+    def test_standard_customer_sources_include_other_in_display_order(self):
+        self.assertEqual(
+            CUSTOMER_SOURCES,
+            ('抖音', '视频号', '服务号', '朋友介绍', '其他'),
+        )
+
+    def test_other_source_can_be_created_and_read_back(self):
+        payload = {
+            'name': '其他来源保存验证',
+            'phone': '13800000009',
+            'source': '其他',
+            'province': '浙江省',
+            'city': '杭州市',
+            'district': '西湖区',
+            'grade': 'B',
+            'description': '仅用于隔离测试数据库',
+            'progress': '需求对接',
+            'plan': '方案待完善',
+            'ownerId': self.business.id,
+            'techId': self.technical.id,
+            'projectTypeId': '',
+        }
+
+        response = self.client.post(
+            reverse('customers-collection'),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        created = response.json()['customer']
+        self.assertEqual(created['source'], '其他')
+        saved = self.client.get(reverse('customer-detail', args=[created['id']])).json()['customer']
+        self.assertEqual(saved['source'], '其他')
+
+    def test_other_source_can_be_saved_by_edit(self):
+        payload = {
+            'name': self.customer.name,
+            'phone': self.customer.phone,
+            'source': '其他',
+            'province': self.customer.province,
+            'city': self.customer.city,
+            'district': self.customer.district,
+            'grade': self.customer.grade,
+            'description': self.customer.description,
+            'progress': self.customer.progress,
+            'plan': self.customer.plan,
+            'ownerId': self.business.id,
+            'techId': self.technical.id,
+        }
+
+        response = self.client.patch(
+            reverse('customer-detail', args=[self.customer.id]),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.source, '其他')
+
+    def test_new_customer_rejects_nonstandard_source(self):
+        payload = {
+            'name': '非规范来源验证',
+            'source': '未知渠道',
+            'province': '浙江省',
+            'city': '杭州市',
+            'grade': 'B',
+            'progress': '需求对接',
+            'projectTypeId': '',
+        }
+
+        response = self.client.post(
+            reverse('customers-collection'),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('客资来源仅支持', response.json()['error'])
+        self.assertFalse(Customer.objects.filter(name='非规范来源验证').exists())
+
     def test_legacy_customer_can_be_edited_without_filling_unrelated_missing_fields(self):
         legacy = Customer.objects.create(
             name='旧客资',
@@ -926,6 +1061,74 @@ class CustomerPersistenceApiTests(TestCase):
         self.assertEqual(legacy.business_owner_name, '原商务负责人')
         self.assertEqual(legacy.technical_owner_name, '原技术负责人')
 
+    def test_overseas_customer_location_is_preserved_without_domestic_suffixes(self):
+        payload = {
+            'name': '海外项目客户',
+            'phone': '001-212-555-0188',
+            'source': '抖音',
+            'referrer': '',
+            'province': 'United States',
+            'city': 'New York',
+            'district': '',
+            'grade': 'B',
+            'description': '海外地区自由输入测试',
+            'progress': '需求对接',
+            'plan': '待进一步沟通',
+            'ownerId': self.business.id,
+            'techId': self.technical.id,
+        }
+
+        response = self.client.patch(
+            reverse('customer-detail', args=[self.customer.id]),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        saved = response.json()['customer']
+        self.assertEqual(saved['province'], 'United States')
+        self.assertEqual(saved['city'], 'New York')
+        self.assertEqual(saved['district'], '')
+        self.assertEqual(saved['region'], 'United States · New York')
+
+    def test_overseas_customer_can_be_created_with_optional_area_and_read_back(self):
+        payload = {
+            'name': '新建海外项目客户',
+            'phone': '+1 415 555 0136',
+            'source': '视频号',
+            'referrer': '',
+            'province': 'United States',
+            'city': 'San Francisco',
+            'district': 'California',
+            'grade': 'A',
+            'description': '海外客户描述完整保存',
+            'progress': '需求对接',
+            'plan': '海外项目方案',
+            'ownerId': self.business.id,
+            'techId': self.technical.id,
+            'projectTypeId': '',
+        }
+
+        response = self.client.post(
+            reverse('customers-collection'),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        created = response.json()['customer']
+        self.assertEqual(created['province'], 'United States')
+        self.assertEqual(created['city'], 'San Francisco')
+        self.assertEqual(created['district'], 'California')
+        self.assertEqual(created['region'], 'United States · San Francisco · California')
+        self.assertEqual(created['description'], '海外客户描述完整保存')
+
+        detail_response = self.client.get(reverse('customer-detail', args=[created['id']]))
+        self.assertEqual(detail_response.status_code, 200)
+        detail = detail_response.json()['customer']
+        self.assertEqual(detail['region'], 'United States · San Francisco · California')
+        self.assertEqual(detail['description'], '海外客户描述完整保存')
+
     def test_customer_import_appends_without_replacing_existing_records(self):
         existing_id = self.customer.id
         original_count = Customer.objects.count()
@@ -947,7 +1150,7 @@ class CustomerPersistenceApiTests(TestCase):
                 {
                     'name': '追加导入乙',
                     'phone': '13800000002',
-                    'source': '视频号',
+                    'source': '其他',
                     'province': '山东省',
                     'city': '济南市',
                     'district': '历下区',
@@ -971,7 +1174,7 @@ class CustomerPersistenceApiTests(TestCase):
         self.assertEqual(Customer.objects.count(), original_count + 2)
         self.assertTrue(Customer.objects.filter(id=existing_id, name='修改前名称').exists())
         self.assertTrue(Customer.objects.filter(name='追加导入甲').exists())
-        self.assertTrue(Customer.objects.filter(name='追加导入乙').exists())
+        self.assertTrue(Customer.objects.filter(name='追加导入乙', source='其他').exists())
 
     def test_customer_import_is_atomic_when_one_row_is_invalid(self):
         original_ids = list(Customer.objects.values_list('id', flat=True))
@@ -1006,6 +1209,30 @@ class CustomerPersistenceApiTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn('第3行', response.json()['error'])
+        self.assertEqual(list(Customer.objects.values_list('id', flat=True)), original_ids)
+
+    def test_customer_import_rejects_nonstandard_source_without_writing_data(self):
+        original_ids = list(Customer.objects.values_list('id', flat=True))
+        payload = {
+            'customers': [{
+                'name': '非规范导入来源',
+                'source': '未登记渠道',
+                'province': '河北省',
+                'city': '石家庄市',
+                'grade': 'B',
+                'progress': '需求对接',
+                'projectTypeId': '',
+            }],
+        }
+
+        response = self.client.post(
+            reverse('customers-import'),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('客资来源仅支持', response.json()['error'])
         self.assertEqual(list(Customer.objects.values_list('id', flat=True)), original_ids)
 
     def test_technical_employee_cannot_delete_customer(self):

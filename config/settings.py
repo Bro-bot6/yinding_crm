@@ -23,10 +23,22 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get(
-    'DJANGO_SECRET_KEY',
-    'django-insecure-local-development-only-change-before-deployment',
-)
+def local_secret_key() -> str:
+    """Reuse the installed server key for every local launch mode.
+
+    The hidden Waitress launcher sets DJANGO_SECRET_KEY explicitly, while
+    manage.py/runserver previously fell back to a different development key.
+    Switching between the two made otherwise valid database sessions unreadable.
+    """
+    secret_file = DATA_DIR / 'secret.key'
+    try:
+        secret = secret_file.read_text(encoding='utf-8').strip()
+    except OSError:
+        secret = ''
+    return secret or 'django-insecure-local-development-only-change-before-deployment'
+
+
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY') or local_secret_key()
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True').lower() == 'true'

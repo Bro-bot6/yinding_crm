@@ -34,6 +34,7 @@ from .models import (
     VisitorRecord,
 )
 from .services import (
+    CUSTOMER_SOURCES,
     FOLLOW_UP_CUSTOMER_GRADES,
     PROGRESS_STAGES,
     follow_up_task_matches_project_progress,
@@ -56,16 +57,16 @@ def health_check(request):
 def available_employees(request):
     users = (
         get_user_model()
-        .objects.filter(is_active=True)
+        .objects.filter(is_active=True, is_superuser=False)
         .select_related('employee_profile')
         .order_by('first_name', 'username')
     )
     result = {'all': [], 'business': [], 'technical': []}
     for user in users:
         profile = getattr(user, 'employee_profile', None)
-        if not user.is_superuser and profile is None:
+        if profile is None:
             continue
-        role = EmployeeProfile.Role.BOTH if user.is_superuser else profile.role
+        role = profile.role
         display_name = (
             profile.nickname if profile and profile.nickname
             else user.get_full_name() or user.username
@@ -78,12 +79,12 @@ def available_employees(request):
             'businessLevel': (
                 profile.business_level
                 if profile and role in (EmployeeProfile.Role.BUSINESS, EmployeeProfile.Role.BOTH)
-                else (5 if user.is_superuser else None)
+                else None
             ),
             'technicalLevel': (
                 profile.technical_level
                 if profile and role in (EmployeeProfile.Role.TECHNICAL, EmployeeProfile.Role.BOTH)
-                else (5 if user.is_superuser else None)
+                else None
             ),
         }
         result['all'].append(employee)
@@ -175,7 +176,7 @@ def serialize_customer(customer):
         'province': customer.province,
         'city': customer.city,
         'district': customer.district,
-        'region': ' · '.join(filter(None, (customer.province, customer.city))),
+        'region': ' · '.join(filter(None, (customer.province, customer.city, customer.district))),
         'grade': customer.grade,
         'description': customer.description,
         'progress': customer.progress,
@@ -237,7 +238,13 @@ def update_customer_from_payload(customer, payload):
     if missing:
         return f"请填写：{'、'.join(missing)}"
 
-    source = str(payload.get('source', '抖音')).strip()
+    source = str(payload.get('source', '')).strip()
+    if source not in CUSTOMER_SOURCES:
+        # 已存在的历史非规范来源可原样保留，避免编辑其他字段时改写真实数据；
+        # 新建、导入和主动修改来源时必须使用统一选项。
+        preserves_legacy_source = bool(customer.pk and source == customer.source)
+        if not preserves_legacy_source:
+            return f"客资来源仅支持：{'、'.join(CUSTOMER_SOURCES)}"
     referrer = str(payload.get('referrer', '')).strip() if source == '朋友介绍' else ''
     if source == '朋友介绍' and not referrer:
         return '朋友介绍的客资必须填写介绍人'
@@ -552,34 +559,66 @@ def normalize_scheme_payload(payload):
     }
 
 
-def calculate_scheme_layer(layer):
-    dosage_ratio = Decimal(str(layer['dosagePercent'])) / Decimal('100')
-    exact_quantity = (
-        Decimal(str(layer['length']))
-        * Decimal(str(layer['width']))
-        * Decimal(str(layer['thickness']))
-        * dosage_ratio
-        * Decimal(str(layer['density']))
-    )
-    rounded_quantity = math.ceil(exact_quantity)
-    square_price = (
-        Decimal(str(layer['thickness']))
-        * dosage_ratio
-        * Decimal(str(layer['density']))
-        * Decimal(str(layer['unitPrice']))
-    )
-    total_price = Decimal(rounded_quantity) * Decimal(str(layer['unitPrice']))
-    return {
-        **layer,
-        'exactQuantity': round(float(exact_quantity), 3),
-        'quantity': rounded_quantity,
-        'squareMeterPrice': round(float(square_price), 2),
+def calculate_scheme_layers(source_layers):
+    """Calculate every layer, then round the combined material quantity once.
+
+    The rounded total is allocated back to layers in proportion to their
+    theoretical quantities so different per-layer prices remain meaningful.
+    """
+    calculated = []
+    total_exact_quantity = Decimal('0')
+    for layer in source_layers:
+        dosage_ratio = Decimal(str(layer['dosagePercent'])) / Decimal('100')
+        exact_quantity = (
+            Decimal(str(layer['length']))
+            * Decimal(str(layer['width']))
+            * Decimal(str(layer['thickness']))
+            * dosage_ratio
+            * Decimal(str(layer['density']))
+        )
+        unit_price = Decimal(str(layer['unitPrice']))
+        square_price = (
+            Decimal(str(layer['thickness']))
+            * dosage_ratio
+            * Decimal(str(layer['density']))
+            * unit_price
+        )
+        calculated.append((layer, exact_quantity, unit_price, square_price))
+        total_exact_quantity += exact_quantity
+
+    total_quantity = math.ceil(total_exact_quantity) if total_exact_quantity > 0 else 0
+    layers = []
+    total_price = Decimal('0')
+    for layer, exact_quantity, unit_price, square_price in calculated:
+        allocated_quantity = (
+            Decimal(total_quantity) * exact_quantity / total_exact_quantity
+            if total_exact_quantity > 0 else Decimal('0')
+        )
+        layer_total_price = round(float(allocated_quantity * unit_price), 2)
+        total_price += Decimal(str(layer_total_price))
+        layers.append({
+            **layer,
+            'exactQuantity': round(float(exact_quantity), 3),
+            'quantity': round(float(allocated_quantity), 3),
+            'squareMeterPrice': round(float(square_price), 2),
+            'totalPrice': layer_total_price,
+        })
+
+    return layers, {
+        'totalExactQuantity': round(float(total_exact_quantity), 3),
+        'totalQuantity': total_quantity,
         'totalPrice': round(float(total_price), 2),
     }
 
 
+def calculate_scheme_layer(layer):
+    """Backward-compatible single-layer calculation using the combined rule."""
+    layers, _totals = calculate_scheme_layers([layer])
+    return layers[0]
+
+
 def serialize_scheme_calculation(calculation, user):
-    layers = [calculate_scheme_layer(layer) for layer in calculation.layers]
+    layers, totals = calculate_scheme_layers(calculation.layers[:calculation.layer_count])
     return {
         'id': calculation.id,
         'projectId': calculation.project_id,
@@ -587,7 +626,7 @@ def serialize_scheme_calculation(calculation, user):
         'layerCount': calculation.layer_count,
         'layers': layers,
         'remarks': calculation.remarks,
-        'totalPrice': round(sum(layer['totalPrice'] for layer in layers), 2),
+        **totals,
         'createdBy': employee_display_name(calculation.created_by, '系统'),
         'updatedBy': employee_display_name(calculation.updated_by, '系统'),
         'createdLabel': timezone.localtime(calculation.created_at).strftime('%Y年%m月%d日 %H:%M'),
@@ -641,6 +680,8 @@ def default_scheme_payload(project):
             'totalPrice': 0,
         }],
         'remarks': '实际掺配比例需根据土质情况结合试验确定。\n此次报价不含运输费用。\n土凝岩材料报价包含13%税点。',
+        'totalExactQuantity': 0,
+        'totalQuantity': 0,
         'totalPrice': 0,
         'createdBy': '',
         'updatedBy': '',
@@ -771,8 +812,8 @@ def build_scheme_workbook(calculation):
     sheet.page_margins.top = 0.35
     sheet.page_margins.bottom = 0.35
 
-    headers = ['序号', '名称', '结构层', '配比说明', '长度m', '宽度m', '厚度m', '掺量', '单价（元/吨）', '土凝岩单平米报价（元/㎡）', '土凝岩用量（吨）', '材料总价（元）']
-    widths = [7, 20, 11, 26, 11, 11, 11, 11, 15, 22, 17, 19]
+    headers = ['序号', '名称', '结构层', '配比说明', '长度m', '宽度m', '厚度m', '掺量', '密度（t/m³）', '单价（元/吨）', '土凝岩单平米报价（元/㎡）', '按总量比例分摊（吨）', '分摊材料金额（元）']
+    widths = [6, 18, 10, 24, 9, 9, 9, 9, 12, 14, 20, 18, 19]
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
 
@@ -788,7 +829,7 @@ def build_scheme_workbook(calculation):
     line_color = 'BDD5CC'
     border = Border(*(Side(style='thin', color=line_color) for _ in range(4)))
 
-    sheet.merge_cells('A1:L2')
+    sheet.merge_cells('A1:M2')
     sheet['A1'] = calculation.title
     sheet['A1'].font = Font(name='微软雅黑', size=21, bold=True, color=white)
     sheet['A1'].fill = PatternFill('solid', fgColor=dark_green)
@@ -796,7 +837,7 @@ def build_scheme_workbook(calculation):
     sheet.row_dimensions[1].height = 30
     sheet.row_dimensions[2].height = 30
 
-    sheet.merge_cells('A3:L3')
+    sheet.merge_cells('A3:M3')
     sheet['A3'] = '银鼎土凝岩  ·  项目材料方案报价'
     sheet['A3'].font = Font(name='微软雅黑', size=10, bold=True, color=dark_green)
     sheet['A3'].fill = PatternFill('solid', fgColor='DCECE5')
@@ -817,7 +858,7 @@ def build_scheme_workbook(calculation):
     for row, (left_label, left_value, right_label, right_value) in enumerate(info_rows, start=4):
         for start_column, end_column, value, is_label in (
             (1, 2, left_label, True), (3, 6, left_value, False),
-            (7, 8, right_label, True), (9, 12, right_value, False),
+            (7, 8, right_label, True), (9, 13, right_value, False),
         ):
             sheet.merge_cells(start_row=row, start_column=start_column, end_row=row, end_column=end_column)
             cell = sheet.cell(row=row, column=start_column, value=value)
@@ -828,25 +869,33 @@ def build_scheme_workbook(calculation):
                 sheet.cell(row=row, column=column).border = border
         sheet.row_dimensions[row].height = 25
 
-    layers = [calculate_scheme_layer(layer) for layer in calculation.layers[:calculation.layer_count]]
+    layers, _totals = calculate_scheme_layers(calculation.layers[:calculation.layer_count])
     dosage_text = ' + '.join(f"{layer['dosagePercent']:g}%" for layer in layers) or '—'
-    total_square_price = sum(layer['squareMeterPrice'] for layer in layers)
-    square_price_text = f'¥{total_square_price:,.2f} /㎡' if layers else '—'
-    total_quantity = sum(layer['quantity'] for layer in layers)
-    total_price = sum(layer['totalPrice'] for layer in layers)
+    first_row = 13
+    last_data_row = first_row + len(layers) - 1
+    exact_quantity_formula = (
+        f'SUMPRODUCT($E${first_row}:$E${last_data_row},'
+        f'$F${first_row}:$F${last_data_row},'
+        f'$G${first_row}:$G${last_data_row},'
+        f'$H${first_row}:$H${last_data_row},'
+        f'$I${first_row}:$I${last_data_row})'
+    )
+    rounded_quantity_formula = f'ROUNDUP({exact_quantity_formula},0)'
     summary_cards = [
-        (1, 3, '推荐掺量', dosage_text, pale_gold, gold, dark_green),
-        (4, 6, '各层单平米报价合计', square_price_text, pale_gold, gold, dark_green),
-        (7, 9, '土凝岩总用量', f'{total_quantity:,.0f} 吨', mint, brand_green, dark_green),
-        (10, 12, '材料总价', f'¥{total_price:,.2f}', dark_green, gold, 'FF5A5F'),
+        (1, 3, '推荐掺量', dosage_text, pale_gold, gold, dark_green, None),
+        (4, 7, '各层单平米报价合计', f'=SUM(K{first_row}:K{last_data_row})', pale_gold, gold, dark_green, '¥#,##0.00 /㎡'),
+        (8, 10, '合并取整总用量', f'={rounded_quantity_formula}', mint, brand_green, dark_green, '0 "吨"'),
+        (11, 13, '材料总价', f'=SUM(M{first_row}:M{last_data_row})', dark_green, gold, 'FF5A5F', '¥#,##0.00'),
     ]
-    for start_column, end_column, label, value, fill_color, accent_color, value_color in summary_cards:
+    for start_column, end_column, label, value, fill_color, accent_color, value_color, number_format in summary_cards:
         sheet.merge_cells(start_row=8, start_column=start_column, end_row=8, end_column=end_column)
         sheet.merge_cells(start_row=9, start_column=start_column, end_row=10, end_column=end_column)
         label_cell = sheet.cell(row=8, column=start_column, value=label)
         value_cell = sheet.cell(row=9, column=start_column, value=value)
         label_cell.font = Font(name='微软雅黑', size=9, bold=True, color=accent_color)
-        value_cell.font = Font(name='微软雅黑', size=16, bold=True, color=value_color)
+        value_cell.font = Font(name='微软雅黑', size=14 if label == '推荐掺量' else 16, bold=True, color=value_color)
+        if number_format:
+            value_cell.number_format = number_format
         label_cell.alignment = Alignment(horizontal='center', vertical='center')
         value_cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         for row in range(8, 11):
@@ -867,12 +916,11 @@ def build_scheme_workbook(calculation):
     for column, header in enumerate(headers, start=1):
         cell = sheet.cell(row=header_row, column=column, value=header)
         cell.font = Font(name='微软雅黑', size=9, bold=True, color=white)
-        cell.fill = PatternFill('solid', fgColor=gold if column in (8, 9, 10, 12) else brand_green)
+        cell.fill = PatternFill('solid', fgColor=gold if column in (8, 9, 10, 11, 13) else brand_green)
         cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         cell.border = border
     sheet.row_dimensions[header_row].height = 38
 
-    first_row = header_row + 1
     for offset, layer in enumerate(layers):
         row = first_row + offset
         mix_description = normalized_mix_description(
@@ -887,52 +935,59 @@ def build_scheme_workbook(calculation):
             layer['width'],
             layer['thickness'],
             layer['dosagePercent'] / 100,
+            layer['density'],
             layer['unitPrice'],
-            layer['squareMeterPrice'],
-            layer['quantity'],
-            layer['totalPrice'],
+            f'=ROUND(G{row}*H{row}*I{row}*J{row},2)',
+            (
+                f'=IF({exact_quantity_formula}=0,0,'
+                f'{rounded_quantity_formula}*(E{row}*F{row}*G{row}*H{row}*I{row})/'
+                f'{exact_quantity_formula})'
+            ),
+            f'=ROUND(L{row}*J{row},2)',
         ]
         for column, value in enumerate(values, start=1):
             cell = sheet.cell(row=row, column=column, value=value)
-            cell.font = Font(name='微软雅黑', size=10, bold=column in (8, 9, 10, 11, 12), color=dark_green if column != 12 else white)
-            if column in (8, 9, 10):
+            cell.font = Font(name='微软雅黑', size=10, bold=column in (8, 9, 10, 11, 12, 13), color=dark_green if column != 13 else white)
+            if column in (8, 9, 10, 11):
                 cell.fill = PatternFill('solid', fgColor=pale_gold)
-            elif column == 11:
-                cell.fill = PatternFill('solid', fgColor=mint)
             elif column == 12:
+                cell.fill = PatternFill('solid', fgColor=mint)
+            elif column == 13:
                 cell.fill = PatternFill('solid', fgColor=brand_green)
             else:
                 cell.fill = PatternFill('solid', fgColor=white if offset % 2 == 0 else pale_mint)
             cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
             cell.border = border
         sheet.cell(row=row, column=8).number_format = '0.00%'
-        for column in (5, 6, 7, 9, 10, 12):
+        for column in (5, 6, 7, 9, 10, 11, 13):
             sheet.cell(row=row, column=column).number_format = '#,##0.00'
-        sheet.cell(row=row, column=11).number_format = '0'
-        sheet.cell(row=row, column=12).number_format = '¥#,##0.00'
+        sheet.cell(row=row, column=9).number_format = '0.000'
+        sheet.cell(row=row, column=12).number_format = '0.000'
+        sheet.cell(row=row, column=13).number_format = '¥#,##0.00'
         sheet.row_dimensions[row].height = 44
 
     total_row = first_row + len(layers)
     sheet.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=7)
     sheet.cell(row=total_row, column=1, value='报价合计')
+    sheet.merge_cells(start_row=total_row, start_column=8, end_row=total_row, end_column=9)
     sheet.cell(row=total_row, column=8, value=dosage_text)
-    sheet.merge_cells(start_row=total_row, start_column=9, end_row=total_row, end_column=10)
-    sheet.cell(row=total_row, column=9, value='土凝岩用量')
-    sheet.cell(row=total_row, column=11, value=total_quantity)
-    sheet.cell(row=total_row, column=12, value=total_price)
-    for column in range(1, 13):
+    sheet.merge_cells(start_row=total_row, start_column=10, end_row=total_row, end_column=11)
+    sheet.cell(row=total_row, column=10, value='合并取整总用量')
+    sheet.cell(row=total_row, column=12, value=f'={rounded_quantity_formula}')
+    sheet.cell(row=total_row, column=13, value=f'=SUM(M{first_row}:M{last_data_row})')
+    for column in range(1, 14):
         cell = sheet.cell(row=total_row, column=column)
-        cell.font = Font(name='微软雅黑', size=11, bold=True, color='FF5A5F' if column == 12 else (white if column == 1 else dark_green))
-        cell.fill = PatternFill('solid', fgColor=dark_green if column in range(1, 8) or column == 12 else pale_gold)
-        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.font = Font(name='微软雅黑', size=11, bold=True, color='FF5A5F' if column == 13 else (white if column == 1 else dark_green))
+        cell.fill = PatternFill('solid', fgColor=dark_green if column in range(1, 8) or column == 13 else pale_gold)
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         cell.border = border
-    sheet.cell(row=total_row, column=8).font = Font(name='微软雅黑', size=12, bold=True, color=dark_green)
-    sheet.cell(row=total_row, column=11).number_format = '0 "吨"'
-    sheet.cell(row=total_row, column=12).number_format = '¥#,##0.00'
+    sheet.cell(row=total_row, column=8).font = Font(name='微软雅黑', size=9, bold=True, color=dark_green)
+    sheet.cell(row=total_row, column=12).number_format = '0 "吨"'
+    sheet.cell(row=total_row, column=13).number_format = '¥#,##0.00'
     sheet.row_dimensions[total_row].height = 34
 
     note_title_row = total_row + 2
-    sheet.merge_cells(start_row=note_title_row, start_column=1, end_row=note_title_row, end_column=12)
+    sheet.merge_cells(start_row=note_title_row, start_column=1, end_row=note_title_row, end_column=13)
     note_title = sheet.cell(row=note_title_row, column=1, value='报价备注 / TERMS & NOTES')
     note_title.font = Font(name='微软雅黑', size=10, bold=True, color=white)
     note_title.fill = PatternFill('solid', fgColor=brand_green)
@@ -952,23 +1007,24 @@ def build_scheme_workbook(calculation):
         number_cell.fill = PatternFill('solid', fgColor=gold)
         number_cell.alignment = Alignment(horizontal='center', vertical='center')
         number_cell.border = border
-        sheet.merge_cells(start_row=row, start_column=2, end_row=row, end_column=12)
+        sheet.merge_cells(start_row=row, start_column=2, end_row=row, end_column=13)
         remark_cell = sheet.cell(row=row, column=2, value=remark)
         remark_cell.font = Font(name='微软雅黑', size=10, color=ink)
         remark_cell.fill = PatternFill('solid', fgColor=pale_mint if offset % 2 == 0 else white)
         remark_cell.alignment = Alignment(vertical='center', horizontal='left', wrap_text=True)
-        for column in range(2, 13):
+        for column in range(2, 14):
             sheet.cell(row=row, column=column).border = border
         sheet.row_dimensions[row].height = 30
 
     sheet.auto_filter.ref = None
     sheet.print_title_rows = '1:12'
-    sheet.print_area = f'A1:L{note_row + len(display_remarks) - 1}'
+    sheet.print_area = f'A1:M{note_row + len(display_remarks) - 1}'
     sheet.oddFooter.center.text = '银鼎土凝岩 · 专业材料方案'
     sheet.oddFooter.center.size = 8
     sheet.oddFooter.center.color = muted
     workbook.calculation.fullCalcOnLoad = True
     workbook.calculation.forceFullCalc = True
+    workbook.calculation.calcMode = 'auto'
     return workbook
 
 

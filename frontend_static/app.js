@@ -1,5 +1,14 @@
 const { createApp, nextTick } = Vue
 
+const CUSTOMER_SOURCES = Object.freeze(['抖音', '视频号', '服务号', '朋友介绍', '其他'])
+const CUSTOMER_SOURCE_PRESENTATION = Object.freeze({
+  抖音: { dotClass: 'douyin', lineClass: 'line-main' },
+  视频号: { dotClass: 'wechat', lineClass: 'line-second' },
+  服务号: { dotClass: 'service-account', lineClass: 'line-third' },
+  朋友介绍: { dotClass: 'referral', lineClass: 'line-fourth' },
+  其他: { dotClass: 'other-source', lineClass: 'line-fifth' },
+})
+
 let themedPopoverSequence = 0
 const nextThemedPopoverId = prefix => `${prefix}-${++themedPopoverSequence}`
 const announceThemedPopover = id => window.dispatchEvent(new CustomEvent('yd-themed-popover-open', { detail: id }))
@@ -229,7 +238,10 @@ createApp({
       regionTree: [],
       regionLoadError: '',
       openRegionMenu: '',
+      newRegionMode: 'domestic',
       newRegionSearch: { province: '', city: '', district: '' },
+      editRegionMode: 'domestic',
+      editRegionSearch: { province: '', city: '', district: '' },
       employees: { all: [], business: [], technical: [] },
       employeeLoadError: '',
       customerLoadError: '',
@@ -451,7 +463,7 @@ createApp({
       return [{ value: 'all', label: '全部人员' }, ...this.visitorHostOptions.map(employee => ({ value: String(employee.id), label: employee.display_name, detail: employee.username }))]
     },
     customerSourceSelectOptions() {
-      return ['抖音', '视频号', '朋友介绍'].map(source => ({ value: source, label: source }))
+      return CUSTOMER_SOURCES.map(source => ({ value: source, label: source }))
     },
     editCustomerSourceSelectOptions() {
       const options = [...this.customerSourceSelectOptions]
@@ -687,7 +699,7 @@ createApp({
       }))
     },
     sourceFilterOptions() {
-      return ['抖音', '视频号', '朋友介绍'].map(value => ({
+      return CUSTOMER_SOURCES.map(value => ({
         value,
         label: value,
         count: this.customerPoolCustomers.filter(customer => customer.source === value).length,
@@ -738,6 +750,10 @@ createApp({
       const word = this.newRegionSearch.district.trim()
       return word ? this.newDistrictOptions.filter(item => item.name.includes(word)) : this.newDistrictOptions
     },
+    editProvinceMatches() {
+      const word = this.editRegionSearch.province.trim()
+      return word ? this.editProvinceOptions.filter(item => item.name.includes(word)) : this.editProvinceOptions
+    },
     editCityOptions() {
       const province = this.regionTree.find(item => item.name === this.editCustomer.province)
       if (!province) return []
@@ -748,6 +764,14 @@ createApp({
     editDistrictOptions() {
       const city = this.editCityOptions.find(item => item.name === this.editCustomer.city)
       return city?.children || []
+    },
+    editCityMatches() {
+      const word = this.editRegionSearch.city.trim()
+      return word ? this.editCityOptions.filter(item => item.name.includes(word)) : this.editCityOptions
+    },
+    editDistrictMatches() {
+      const word = this.editRegionSearch.district.trim()
+      return word ? this.editDistrictOptions.filter(item => item.name.includes(word)) : this.editDistrictOptions
     },
     gradeStats() {
       const total = this.reportingCustomers.length
@@ -768,11 +792,10 @@ createApp({
       })
     },
     sourceStats() {
-      const sourceClasses = { 抖音: 'douyin', 视频号: 'wechat', 朋友介绍: 'referral' }
-      return ['抖音', '视频号', '朋友介绍'].map(name => ({
+      return CUSTOMER_SOURCES.map(name => ({
         name,
         value: this.recent30Customers.filter(customer => customer.source === name).length,
-        className: sourceClasses[name],
+        className: CUSTOMER_SOURCE_PRESENTATION[name].dotClass,
       }))
     },
     topRegions() {
@@ -930,34 +953,34 @@ createApp({
       start.setDate(start.getDate() - 29)
       start.setHours(0, 0, 0, 0)
       const offsets = [0, 6, 12, 18, 24, 29]
-      const sources = [
-        { name: '抖音', className: 'line-main' },
-        { name: '视频号', className: 'line-second' },
-        { name: '朋友介绍', className: 'line-third' },
-      ]
-      const dates = offsets.map(offset => {
+      const sources = CUSTOMER_SOURCES.map(name => ({
+        name,
+        className: CUSTOMER_SOURCE_PRESENTATION[name].lineClass,
+      }))
+      const dates = Array.from({ length: 30 }, (_, offset) => {
         const value = new Date(start)
         value.setDate(start.getDate() + offset)
-        if (offset === 29) value.setTime(today.getTime())
         return value
       })
-      const valuesBySource = sources.map(source => dates.map(point => (
-        this.recent30Customers.filter(customer => {
-          const created = new Date(customer.createdAt || customer.createdDate)
-          return customer.source === source.name && created <= point
+      const valuesBySource = sources.map(source => dates.map(point => {
+        const dateKey = this.formatLocalDate(point)
+        return this.recent30Customers.filter(customer => {
+          const createdKey = customer.createdDate || this.formatLocalDate(new Date(customer.createdAt))
+          return customer.source === source.name && createdKey === dateKey
         }).length
-      )))
+      }))
       const maximum = Math.max(4, ...valuesBySource.flat())
       const yFor = value => 200 - (value / maximum * 170)
+      const xFor = index => index / (dates.length - 1) * 700
       return {
         maximum,
         ticks: [maximum, Math.round(maximum * .75), Math.round(maximum * .5), Math.round(maximum * .25), 0],
-        labels: dates.map(date => `${date.getMonth() + 1}月${date.getDate()}日`),
+        labels: offsets.map(offset => `${dates[offset].getMonth() + 1}月${dates[offset].getDate()}日`),
         series: sources.map((source, sourceIndex) => {
-          const points = valuesBySource[sourceIndex].map((value, index) => `${index * 140},${yFor(value)}`).join(' ')
+          const points = valuesBySource[sourceIndex].map((value, index) => `${xFor(index)},${yFor(value)}`).join(' ')
           return { ...source, points }
         }),
-        areaPoints: `0,220 ${valuesBySource[0].map((value, index) => `${index * 140},${yFor(value)}`).join(' ')} 700,220`,
+        areaPoints: `0,220 ${valuesBySource[0].map((value, index) => `${xFor(index)},${yFor(value)}`).join(' ')} 700,220`,
       }
     },
     projectTypeStats() {
@@ -1050,22 +1073,26 @@ createApp({
       start.setDate(start.getDate() - 29)
       start.setHours(0, 0, 0, 0)
       const offsets = [0, 6, 12, 18, 24, 29]
-      const dates = offsets.map(offset => {
+      const dates = Array.from({ length: 30 }, (_, offset) => {
         const value = new Date(start)
         value.setDate(start.getDate() + offset)
-        if (offset === 29) value.setTime(today.getTime())
         return value
       })
-      const visits = dates.map(point => this.recent30VisitorRecords.filter(item => new Date(`${item.visitDate}T12:00:00`) <= point).length)
-      const people = dates.map(point => this.recent30VisitorRecords.filter(item => new Date(`${item.visitDate}T12:00:00`) <= point).reduce((sum, item) => sum + Number(item.visitorCount || 0), 0))
+      const dailyRecords = dates.map(point => {
+        const dateKey = this.formatLocalDate(point)
+        return this.recent30VisitorRecords.filter(item => String(item.visitDate || '').slice(0, 10) === dateKey)
+      })
+      const visits = dailyRecords.map(records => records.length)
+      const people = dailyRecords.map(records => records.reduce((sum, item) => sum + Number(item.visitorCount || 0), 0))
       const maximum = Math.max(4, ...visits, ...people)
       const yFor = value => 200 - (value / maximum * 170)
+      const xFor = index => index / (dates.length - 1) * 700
       return {
         ticks: [maximum, Math.round(maximum * .75), Math.round(maximum * .5), Math.round(maximum * .25), 0],
-        labels: dates.map(date => `${date.getMonth() + 1}月${date.getDate()}日`),
-        visitsPoints: visits.map((value, index) => `${index * 140},${yFor(value)}`).join(' '),
-        peoplePoints: people.map((value, index) => `${index * 140},${yFor(value)}`).join(' '),
-        areaPoints: `0,220 ${visits.map((value, index) => `${index * 140},${yFor(value)}`).join(' ')} 700,220`,
+        labels: offsets.map(offset => `${dates[offset].getMonth() + 1}月${dates[offset].getDate()}日`),
+        visitsPoints: visits.map((value, index) => `${xFor(index)},${yFor(value)}`).join(' '),
+        peoplePoints: people.map((value, index) => `${xFor(index)},${yFor(value)}`).join(' '),
+        areaPoints: `0,220 ${visits.map((value, index) => `${xFor(index)},${yFor(value)}`).join(' ')} 700,220`,
       }
     },
     hasOpenOverlay() {
@@ -2224,6 +2251,8 @@ createApp({
         layers: [this.emptySchemeLayer(0)],
         remarks: remarksLines.join('\n'),
         remarksLines,
+        totalExactQuantity: 0,
+        totalQuantity: 0,
         totalPrice: 0,
         createdLabel: '',
         updatedLabel: '',
@@ -2291,27 +2320,52 @@ createApp({
       if (this.schemeCalculation.remarksLines.length <= 3) return
       this.schemeCalculation.remarksLines.splice(index, 1)
     },
-    schemeLayerPreview(layer) {
-      const length = Number(layer?.length) || 0
-      const width = Number(layer?.width) || 0
-      const thickness = Number(layer?.thickness) || 0
-      const dosage = (Number(layer?.dosagePercent) || 0) / 100
-      const density = Number(layer?.density) || 0
-      const unitPrice = Number(layer?.unitPrice) || 0
-      const exactQuantity = length * width * thickness * dosage * density
-      const quantity = exactQuantity > 0 ? Math.ceil(exactQuantity - Number.EPSILON) : 0
-      return {
-        exactQuantity,
-        quantity,
+    schemeCalculationPreview() {
+      const sourceLayers = this.schemeCalculation.layers.slice(0, this.schemeCalculation.layerCount)
+      const layers = sourceLayers.map(layer => {
+        const length = Number(layer?.length) || 0
+        const width = Number(layer?.width) || 0
+        const thickness = Number(layer?.thickness) || 0
+        const dosage = (Number(layer?.dosagePercent) || 0) / 100
+        const density = Number(layer?.density) || 0
+        const unitPrice = Number(layer?.unitPrice) || 0
+        return {
+          exactQuantity: length * width * thickness * dosage * density,
+          quantity: 0,
           squareMeterPrice: thickness * dosage * density * unitPrice,
-        totalPrice: quantity * unitPrice,
+          unitPrice,
+          totalPrice: 0,
+        }
+      })
+      const totalExactQuantity = layers.reduce((sum, layer) => sum + layer.exactQuantity, 0)
+      const totalQuantity = totalExactQuantity > 0 ? Math.ceil(totalExactQuantity - 1e-9) : 0
+      layers.forEach(layer => {
+        layer.quantity = totalExactQuantity > 0
+          ? totalQuantity * layer.exactQuantity / totalExactQuantity
+          : 0
+        layer.totalPrice = Math.round(layer.quantity * layer.unitPrice * 100) / 100
+      })
+      return {
+        layers,
+        totalExactQuantity,
+        totalQuantity,
+        totalPrice: layers.reduce((sum, layer) => sum + layer.totalPrice, 0),
+      }
+    },
+    schemeLayerPreview(layer, index = null) {
+      const layerIndex = index === null ? this.schemeCalculation.layers.indexOf(layer) : index
+      return this.schemeCalculationPreview().layers[layerIndex] || {
+        exactQuantity: 0,
+        quantity: 0,
+        squareMeterPrice: 0,
+        totalPrice: 0,
       }
     },
     schemeMoney(value) {
       return `¥${Number(value || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
     },
     schemeTotalPrice() {
-      return this.schemeCalculation.layers.reduce((sum, layer) => sum + this.schemeLayerPreview(layer).totalPrice, 0)
+      return this.schemeCalculationPreview().totalPrice
     },
     schemePayload() {
       return {
@@ -2363,7 +2417,7 @@ createApp({
         if (!response.ok) throw new Error(data.error || `测算保存失败（${response.status}）`)
         this.schemeCalculation = this.normalizeSchemeCalculation(data.calculation, customer)
         this.customerSchemeCalculation = data.calculation
-        if (!silent) this.showToast('方案测算已保存，用量已按整吨向上取整')
+        if (!silent) this.showToast('方案测算已保存，各层理论用量合并后按整吨向上取整')
         return true
       } catch (error) {
         this.showToast(`保存失败：${error.message || '请稍后重试'}`)
@@ -2417,21 +2471,82 @@ createApp({
     onEditCityChange() {
       this.editCustomer.district = ''
     },
+    setRegionMode(target, mode) {
+      const modeKey = target === 'edit' ? 'editRegionMode' : 'newRegionMode'
+      const customerKey = target === 'edit' ? 'editCustomer' : 'newCustomer'
+      const searchKey = target === 'edit' ? 'editRegionSearch' : 'newRegionSearch'
+      if (this[modeKey] === mode) return
+      this[modeKey] = mode
+      this[customerKey].province = ''
+      this[customerKey].city = ''
+      this[customerKey].district = ''
+      this[searchKey] = { province: '', city: '', district: '' }
+      this.openRegionMenu = ''
+    },
     newRegionMenuKey(type) {
       return `new${type.charAt(0).toUpperCase()}${type.slice(1)}`
+    },
+    editRegionMenuKey(type) {
+      return `edit${type.charAt(0).toUpperCase()}${type.slice(1)}`
     },
     newRegionInputValue(type) {
       return this.openRegionMenu === this.newRegionMenuKey(type)
         ? this.newRegionSearch[type]
         : this.newCustomer[type]
     },
+    editRegionInputValue(type) {
+      return this.openRegionMenu === this.editRegionMenuKey(type)
+        ? this.editRegionSearch[type]
+        : this.editCustomer[type]
+    },
     beginNewRegionSearch(type) {
       this.newRegionSearch[type] = this.newCustomer[type] || ''
       this.openRegionMenu = this.newRegionMenuKey(type)
     },
+    beginEditRegionSearch(type) {
+      this.editRegionSearch[type] = this.editCustomer[type] || ''
+      this.openRegionMenu = this.editRegionMenuKey(type)
+    },
     searchNewRegion(type, value) {
       this.newRegionSearch[type] = value
+      this.syncRegionInput('new', type, value)
       this.openRegionMenu = this.newRegionMenuKey(type)
+    },
+    searchEditRegion(type, value) {
+      this.editRegionSearch[type] = value
+      this.syncRegionInput('edit', type, value)
+      this.openRegionMenu = this.editRegionMenuKey(type)
+    },
+    syncRegionInput(target, type, value) {
+      const customer = target === 'edit' ? this.editCustomer : this.newCustomer
+      const search = target === 'edit' ? this.editRegionSearch : this.newRegionSearch
+      if (customer[type] === value) return
+      customer[type] = value
+      if (type === 'province') {
+        customer.city = ''
+        customer.district = ''
+        search.city = ''
+        search.district = ''
+      } else if (type === 'city') {
+        customer.district = ''
+        search.district = ''
+      }
+    },
+    regionOptionsFor(target, type) {
+      const prefix = target === 'edit' ? 'edit' : 'new'
+      return this[`${prefix}${type.charAt(0).toUpperCase()}${type.slice(1)}Options`] || []
+    },
+    canUseRegionInput(target, type) {
+      const search = target === 'edit' ? this.editRegionSearch : this.newRegionSearch
+      const value = String(search[type] || '').trim()
+      return Boolean(value && !this.regionOptionsFor(target, type).some(item => item.name === value))
+    },
+    commitRegionInput(target, type) {
+      const search = target === 'edit' ? this.editRegionSearch : this.newRegionSearch
+      const value = String(search[type] || '').trim()
+      if (!value) return
+      const methodPrefix = target === 'edit' ? 'selectEdit' : 'selectNew'
+      this[`${methodPrefix}${type.charAt(0).toUpperCase()}${type.slice(1)}`](value)
     },
     toggleRegionMenu(menu) {
       this.openRegionMenu = this.openRegionMenu === menu ? '' : menu
@@ -2452,15 +2567,19 @@ createApp({
     selectEditProvince(province) {
       this.editCustomer.province = province
       this.onEditProvinceChange()
+      this.editRegionSearch = { province: '', city: '', district: '' }
       this.openRegionMenu = ''
     },
     selectEditCity(city) {
       this.editCustomer.city = city
       this.onEditCityChange()
+      this.editRegionSearch.city = ''
+      this.editRegionSearch.district = ''
       this.openRegionMenu = ''
     },
     selectEditDistrict(district) {
       this.editCustomer.district = district
+      this.editRegionSearch.district = ''
       this.openRegionMenu = ''
     },
     selectNewProvince(province) {
@@ -2594,13 +2713,30 @@ createApp({
       this.openRegionMenu = ''
     },
     locationParts(customer) {
-      const regionParts = String(customer.region || '').split(/[·\s/]+/).map(item => item.trim()).filter(Boolean)
+      const regionText = String(customer.region || '').trim()
+      const regionParts = (/[·/]/.test(regionText)
+        ? regionText.split(/\s*[·/]\s*/)
+        : regionText.split(/\s+/)
+      ).map(item => item.trim()).filter(Boolean)
       const rawProvince = String(customer.province || regionParts[0] || '待完善')
       const rawCity = String(customer.city || regionParts[1] || '待完善')
       const province = this.normalizeProvinceName(rawProvince)
-      const city = rawCity === '待完善' || /市$/.test(rawCity) ? rawCity : `${rawCity}市`
-      const district = String(customer.district || regionParts[2] || '区县待完善')
+      const city = this.normalizeCityName(rawCity, province)
+      const domestic = province.includes('待完善') || this.isDomesticProvinceName(province)
+      const district = String(customer.district || regionParts[2] || (domestic ? '区县待完善' : '区域未填写'))
       return { province, city, district }
+    },
+    locationLabel(customer) {
+      const province = this.locationParts(customer).province
+      return province.includes('待完善') || this.isDomesticProvinceName(province)
+        ? '省 / 市 / 区'
+        : '国家 / 城市 / 区域'
+    },
+    isDomesticProvinceName(value) {
+      const name = String(value || '').trim()
+      const fullNames = ['北京市', '上海市', '天津市', '重庆市', '广西壮族自治区', '内蒙古自治区', '西藏自治区', '宁夏回族自治区', '新疆维吾尔自治区', '香港特别行政区', '澳门特别行政区']
+      const shortNames = ['北京', '上海', '天津', '重庆', '广西', '内蒙古', '西藏', '宁夏', '新疆', '香港', '澳门', '河北', '山西', '辽宁', '吉林', '黑龙江', '江苏', '浙江', '安徽', '福建', '江西', '山东', '河南', '湖北', '湖南', '广东', '海南', '四川', '贵州', '云南', '陕西', '甘肃', '青海', '台湾']
+      return fullNames.includes(name) || shortNames.includes(name) || shortNames.some(item => name === `${item}省`) || /(?:省|自治区|特别行政区)$/.test(name)
     },
     normalizeProvinceName(value) {
       const name = String(value || '').trim()
@@ -2609,7 +2745,15 @@ createApp({
       const municipalities = ['北京', '上海', '天津', '重庆']
       const autonomousRegions = { 广西: '广西壮族自治区', 内蒙古: '内蒙古自治区', 西藏: '西藏自治区', 宁夏: '宁夏回族自治区', 新疆: '新疆维吾尔自治区' }
       if (municipalities.includes(name)) return `${name}市`
-      return autonomousRegions[name] || `${name}省`
+      if (autonomousRegions[name]) return autonomousRegions[name]
+      const provinces = ['河北', '山西', '辽宁', '吉林', '黑龙江', '江苏', '浙江', '安徽', '福建', '江西', '山东', '河南', '湖北', '湖南', '广东', '海南', '四川', '贵州', '云南', '陕西', '甘肃', '青海', '台湾']
+      return provinces.includes(name) ? `${name}省` : name
+    },
+    normalizeCityName(value, province) {
+      const name = String(value || '').trim()
+      if (!name || name === '待完善') return '待完善'
+      if (!this.isDomesticProvinceName(province) || /市$|州$|盟$|地区$|自治州$|特别行政区$/.test(name)) return name
+      return `${name}市`
     },
     customerDescription(customer) {
       if (String(customer.description || '').trim()) return customer.description
@@ -2680,7 +2824,10 @@ createApp({
         if (missingHeaders.length) throw new Error(`缺少列：${missingHeaders.join('、')}`)
         const imported = rows.filter(row => String(row['客户名称'] || '').trim()).map((row, index) => {
           const grade = String(row['客户等级'] || 'D').trim().toUpperCase()
-          const source = String(row['客资来源'] || '其他').trim()
+          const source = String(row['客资来源'] || '').trim()
+          if (!CUSTOMER_SOURCES.includes(source)) {
+            throw new Error(`第 ${index + 2} 行“客资来源”仅支持：${CUSTOMER_SOURCES.join('、')}`)
+          }
           const province = String(row['省'] || '').trim()
           const city = String(row['市'] || '').trim()
           const progress = String(row['项目进度'] || '需求对接').trim()
@@ -2737,7 +2884,7 @@ createApp({
       customers.forEach(customer => {
         if (customer.grade === 'D') return
         const province = this.locationParts(customer).province
-        if (!province || province.includes('待完善')) return
+        if (!province || province.includes('待完善') || !this.isDomesticProvinceName(province)) return
         if (!grouped.has(province)) grouped.set(province, { name: province, all: 0, A: 0, B: 0, C: 0 })
         const item = grouped.get(province)
         item.all += 1
@@ -2791,6 +2938,7 @@ createApp({
     },
     openCreateCustomer() {
       this.newCustomer = this.emptyNewCustomer()
+      this.newRegionMode = 'domestic'
       this.newRegionSearch = { province: '', city: '', district: '' }
       this.openRegionMenu = ''
       this.showCreateUnsavedConfirm = false
@@ -2813,6 +2961,7 @@ createApp({
       this.showCreate = false
       this.createSnapshot = ''
       this.openRegionMenu = ''
+      this.newRegionMode = 'domestic'
       this.newRegionSearch = { province: '', city: '', district: '' }
       this.newCustomer = this.emptyNewCustomer()
     },
@@ -2843,6 +2992,8 @@ createApp({
         description: customer.description || '',
       }
       this.editSnapshot = JSON.stringify(this.editCustomer)
+      this.editRegionMode = location.province.includes('待完善') || this.isDomesticProvinceName(location.province) ? 'domestic' : 'overseas'
+      this.editRegionSearch = { province: '', city: '', district: '' }
       this.customerFollowUps = []
       this.customerProgressUpdates = []
       this.customerVisitorRecords = []
@@ -2886,6 +3037,8 @@ createApp({
       this.expandedProgressUpdateId = null
       this.expandedCustomerProgressStage = ''
       this.customerFollowUpsError = ''
+      this.editRegionMode = 'domestic'
+      this.editRegionSearch = { province: '', city: '', district: '' }
       if (visitorReturnId) {
         this.visitorDetailReturnRecordId = null
         const record = this.visitorRecords.find(item => item.id === visitorReturnId)
@@ -2948,7 +3101,7 @@ createApp({
         return
       }
       if (!this.editCustomer.province || !this.editCustomer.city) {
-        this.showToast('请选择项目所在的省份和城市')
+        this.showToast(this.editRegionMode === 'overseas' ? '请填写项目所在国家/地区和城市' : '请选择或输入项目所在的省份和城市')
         return
       }
       const original = this.customers[this.editingIndex]
@@ -2982,8 +3135,7 @@ createApp({
         this.syncSummaryData()
         await this.loadFollowUpTasks()
         this.closeCustomerEdit()
-        if (!returnToVisitorDetail) {
-          this.resetFilters()
+        if (!returnToVisitorDetail && this.activePage !== 'customers') {
           this.switchPage('customers')
         }
         this.showToast(`${savedCustomer.name} 的客资信息已保存到数据库`)
@@ -3006,8 +3158,8 @@ createApp({
         this.showToast('朋友介绍的客资必须填写介绍人')
         return
       }
-      if (!this.newCustomer.province || !this.newCustomer.city || !this.newCustomer.district) {
-        this.showToast('请从候选项中完整选择项目所在的省、市、区 / 县')
+      if (!this.newCustomer.province || !this.newCustomer.city || (this.newRegionMode === 'domestic' && !this.newCustomer.district)) {
+        this.showToast(this.newRegionMode === 'overseas' ? '请填写项目所在国家/地区和城市' : '请选择或输入完整的省、市、区 / 县')
         return
       }
       const businessOwner = this.employees.business.find(employee => employee.id === this.newCustomer.ownerId)
