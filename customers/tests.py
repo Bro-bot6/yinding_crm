@@ -455,6 +455,7 @@ class OverviewStatisticsApiTests(TestCase):
             {'name': '视频号', 'count': 0},
             {'name': '服务号', 'count': 0},
             {'name': '朋友介绍', 'count': 0},
+            {'name': '其他', 'count': 0},
         ])
         self.assertEqual(len(payload['customers']['trendBuckets']), 6)
         self.assertTrue(all(bucket['total'] == 0 for bucket in payload['customers']['trendBuckets']))
@@ -467,10 +468,10 @@ class OverviewStatisticsApiTests(TestCase):
 
     def test_overview_ignores_legacy_source_without_crashing(self):
         Customer.objects.create(
-            name='历史其他来源客资',
+            name='历史非标准来源客资',
             phone='legacy-source',
             grade='C',
-            source='其他',
+            source='历史渠道',
         )
         self.client.force_login(self.admin)
 
@@ -484,6 +485,7 @@ class OverviewStatisticsApiTests(TestCase):
             {'name': '视频号', 'count': 0},
             {'name': '服务号', 'count': 0},
             {'name': '朋友介绍', 'count': 0},
+            {'name': '其他', 'count': 0},
         ])
         self.assertTrue(all(bucket['total'] == 0 for bucket in payload['customers']['trendBuckets']))
 
